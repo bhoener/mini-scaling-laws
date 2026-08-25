@@ -1,0 +1,5 @@
+*.npy
+*.pyc
+input.txt
+wandb/
+data/

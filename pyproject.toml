@@ -1,0 +1,15 @@
+[project]
+name = "mini-scaling-laws"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=5.0.1",
+    "einops>=0.8.2",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.2",
+    "torch>=2.13.0",
+    "tqdm>=4.70.0",
+    "wandb>=0.28.2",
+]
