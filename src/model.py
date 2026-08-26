@@ -66,6 +66,33 @@ class SwiGLU(nn.Module):
         o = self.W(x)
         return self.W2((o * F.sigmoid(o)) * self.V(x))
 
+class MoE(nn.Module):
+    def __init__(self, num_experts: int, num_active: int, d_in: int, d_h: int, d_out: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_active = num_active
+        self.d_in = d_in
+        self.d_h = d_h
+        self.d_out = d_out
+
+        self.WG = nn.Linear(d_in, num_experts)
+        self.WN = nn.Linear(d_in, num_experts)
+
+        self.W1 = nn.Parameter(torch.randn(num_experts, d_in, d_h))
+        self.W2 = nn.Parameter(torch.randn(num_experts, d_h, d_out))
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        G = self.WG(x)
+        G = G + torch.randn_like(G, self.num_active, device=x.device) * F.softplus(self.WN(x))
+
+        idx = torch.topk(G, dim=-1).indices
+
+        # hmm this is probably very wrong
+        return self.act(einsum(x, self.W2, G[idx], "b l d, n d h, n -> b l h")) @ self.W2[idx]
+
+
+
 class DecoderBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()

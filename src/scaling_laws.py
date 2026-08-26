@@ -11,6 +11,8 @@ from tokenizer import VOCAB_SIZE
 def main() -> None:
     import wandb
 
+    torch.set_float32_matmul_precision("high")
+
     DEFAULT_CONFIG = {
         "vocab_size": VOCAB_SIZE,
         "head_dim": 20,
