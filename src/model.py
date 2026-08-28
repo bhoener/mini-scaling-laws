@@ -84,12 +84,17 @@ class MoE(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         G = self.WG(x)
-        G = G + torch.randn_like(G, self.num_active, device=x.device) * F.softplus(self.WN(x))
+        G = G + torch.randn_like(G, device=x.device) * F.softplus(self.WN(x))
 
-        idx = torch.topk(G, dim=-1).indices
+        idx = torch.topk(G, self.num_active, dim=-1).indices
+        print(idx, idx.size())
+        print(G.size())
 
-        # hmm this is probably very wrong
-        return self.act(einsum(x, self.W2, G[idx], "b l d, n d h, n -> b l h")) @ self.W2[idx]
+        print(x.size())
+        print(self.W1.size())
+        print(torch.gather(G, dim=-1, index=idx).size())
+        # definitely very wrong
+        return self.act(einsum(x, self.W1[idx], torch.gather(G, dim=-1, index=idx), "b l d, b l n d h, b l n -> b l h")) @ self.W2[idx]
 
 
 
@@ -146,6 +151,10 @@ def main() -> None:
     db = DecoderBlock(128, 16)
     assert db(torch.randn(2, 4, 128)).size() == (2, 4, 128)
     print("decoder block shapes correct")
+
+    moe = MoE(8, 2, 64, 128, 64)
+    assert moe(torch.randn(2, 4, 64)).size() == (2, 4, 64)
+    print("moe shapes correct")
 
     gpt = GPT(vocab_size=14, d_model=20*16, n_heads=16, n_layers=12)
     assert gpt(torch.randint(0, 14, (2, 8))).size() == (2, 8, 14)

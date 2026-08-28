@@ -25,6 +25,7 @@ def main() -> None:
         "lr_muon": 3e-4,
         "cooldown_frac": 0.2,
         "moe": False,
+        "moe_experts": 32,
     }
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
