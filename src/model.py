@@ -83,18 +83,27 @@ class MoE(nn.Module):
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.size()
         G = self.WG(x)
         G = G + torch.randn_like(G, device=x.device) * F.softplus(self.WN(x))
 
-        idx = torch.topk(G, self.num_active, dim=-1).indices
-        print(idx, idx.size())
-        print(G.size())
+        # we want to group tokens into batches and send those groups through their corresponding experts
+        # probably best to flatten batch/time?
+        # just get (-1, C)
+        # then rearrange to (groups, per_group_length*, C)
+        # then do matmul with weight of shape (groups, C, H)
 
-        print(x.size())
-        print(self.W1.size())
-        print(torch.gather(G, dim=-1, index=idx).size())
-        # definitely very wrong
-        return self.act(einsum(x, self.W1[idx], torch.gather(G, dim=-1, index=idx), "b l d, b l n d h, b l n -> b l h")) @ self.W2[idx]
+        # also need to remember we have multiple experts per token
+        # so (num_active, groups, per_group_length*, C)
+
+        print(G.flatten())
+        x = x.flatten()
+        idx = torch.topk(G, self.num_active).indices
+        print(idx)
+
+        grouped_tokens = torch.nested.nested_tensor([x[i] for i in idx], layout=torch.jagged)
+
+        return rearrange(self.act(grouped_tokens @ self.W1) @ self.W2[idx], "(b t c) -> b t c", b=B, t=T, c=C)
 
 
 
