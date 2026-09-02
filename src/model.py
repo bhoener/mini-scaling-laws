@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, einsum
+from einops import rearrange, einsum, repeat
 
 def norm(x: torch.Tensor) -> torch.Tensor:
     return F.rms_norm(x, (x.size(-1),))
@@ -96,10 +96,16 @@ class MoE(nn.Module):
         # also need to remember we have multiple experts per token
         # so (num_active, groups, per_group_length*, C)
 
-        print(G.flatten())
-        x = x.flatten()
-        idx = torch.topk(G, self.num_active).indices
+        # we have a list of per-token selected experts
+        # we want to get a jagged tensor containing groups of tokens
+
+        print(G)
+        idx = rearrange(torch.topk(G, self.num_active).indices, "b t a -> b (t a)")
         print(idx)
+
+        x_repeated = repeat(x, "b t c -> b (n t) c", n=self.num_experts)
+
+        # now do indexing?
 
         grouped_tokens = torch.nested.nested_tensor([x[i] for i in idx], layout=torch.jagged)
 
