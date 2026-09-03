@@ -82,7 +82,7 @@ class MoE(nn.Module):
         self.W2 = nn.Parameter(torch.randn(num_experts, d_h, d_out))
         self.act = nn.SiLU()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, use_kernel=False) -> torch.Tensor:
         B, T, C = x.size()
         G = self.WG(x)
         G = G + torch.randn_like(G, device=x.device) * F.softplus(self.WN(x))
@@ -99,17 +99,184 @@ class MoE(nn.Module):
         # we have a list of per-token selected experts
         # we want to get a jagged tensor containing groups of tokens
 
+        # but how to do this?
+
         print(G)
-        idx = rearrange(torch.topk(G, self.num_active).indices, "b t a -> b (t a)")
+
+
+        idx = torch.topk(G, self.num_active).indices
         print(idx)
 
-        x_repeated = repeat(x, "b t c -> b (n t) c", n=self.num_experts)
+        mask = torch.ones_like(G, device=x.device).bool()
+        mask.scatter_(-1, idx, 0)
 
-        # now do indexing?
+        G[mask] = float("-inf")
 
-        grouped_tokens = torch.nested.nested_tensor([x[i] for i in idx], layout=torch.jagged)
+        probs = F.softmax(G, dim=-1)
 
-        return rearrange(self.act(grouped_tokens @ self.W1) @ self.W2[idx], "(b t c) -> b t c", b=B, t=T, c=C)
+        probs = rearrange(probs, "b t n -> (b t) n")
+
+        # now we have a sparse tensor of topk probs of shape (B x T x N)
+
+        # seems like there are two ways to build the jagged tensor
+        # 1) go per-token through the topk probs and conditionally insert
+        # 2) go per-expert through the topk probs (eg. probs[:, :, i]) and take nonzeros
+
+        # not sure if things will be differentiable
+
+        print(probs)
+        print(probs.size())
+
+
+        jagged = []
+        indices = []
+
+        flattened_x = rearrange(x, "b t c -> (b t) c")
+
+        for expert in range(self.num_experts):
+            expert_indices = torch.nonzero(probs[:, expert]).squeeze(-1)
+            jagged.append(flattened_x[expert_indices])
+            indices.append(expert_indices)
+
+        grouped = torch.nested.nested_tensor(jagged, layout=torch.jagged)
+
+        print(grouped, grouped.size())
+
+        # ok good. now we have a group tensor of shape (num_experts, j1, d_model)
+        # where j1 represents the tokens per expert
+        # in theory all we have to do from here is matmul by the weight
+
+        # ooh https://docs.pytorch.org/docs/2.14/generated/torch.nn.functional.grouped_mm.html
+        # need to make sure we cast to bf16 and have >= 80 SMs
+
+
+        if use_kernel:
+            l1preact = F.grouped_mm(grouped, self.W1)
+            mlp_outs = F.grouped_mm(self.act(l1preact), self.W2)
+        else:
+            l1preact = grouped @ self.W1
+            mlp_outs = self.act(l1preact) @ self.W2
+
+        print(l1preact.size())
+        print(mlp_outs.size())
+
+
+        print(indices)
+
+        flattened_gates = rearrange(G, "b t n -> (b t) n")
+
+        # now we have mlp outs in shape (num_experts, j1, d_model)
+        # we must rearrange to (B, T, d_model) given the previous indices
+        # but we can first do (b t) d_model since we flattened
+
+        # our indices are of size num_experts (b t)
+        # need to do some sort of inverse
+
+        # in order to create the grouped tensor, we take indices along probs[:, expert]
+        # we could do the very long way:
+
+        # out = torch.empty(B * T, C)
+        # for expert, expert_indices in enumerate(indices):
+        #     for k, i in enumerate(expert_indices):
+        #         out[i] = out[i] + mlp_outs[expert, k] * flattened_gates[i, expert]
+
+        # but it would prob be extremely slow, esp in backward pass
+
+        # seems like the play is to either use some hidden built-in function
+        # or to use .values and .offsets of the jagged tensor
+
+        print(grouped.values(), grouped.values().size())
+
+        # it looks like if we use .values, we get a tensor of size (B * T * active_experts, d_model)
+        # this is very good (assuming we can backward through it all, which looks like yes)
+        # it would be nice if we could use scatter, but we need to multiply by gates and sum
+        # across experts first. we could concatenate the indices and use them as an index tensor
+        # to sort the values with
+
+
+        # if we have some tokens per expert
+        # [[t2 t7 t1 t4]
+        #  [t6 t5 t0 t3 t2]
+        #  [t3 t8 t4]]
+
+        # flattened to
+        # [t2 t7 t1 t4 t6 t5 t0 t3 t2 t3 t8 t4]
+
+        # we have idx
+        # [ 2  7  1  4  6  5  0  3  2  3  8  4]
+        
+        # what if we construct an empty out tensor
+        # then do out[idx] = values
+
+        # nope. recall that we will have multiple of the same token across experts
+        # because we have multiple active experts per token
+
+        # indices are the same shape as the flattened tokens, but they only go up to B * T
+        # and not B * T * num_active
+
+        # so what to do?
+        # if we rearranged the gate values and multiplied them, we would still have to rearrange to reduce
+        # seems we are forced to rearrange the tokens
+        # there are two ways to do this:
+
+        # - make an empty (B * T * num_active, d_model) tensor and index into it, putting tokens of the same
+        # index next to each other
+        # - make an empty (num_active, B * T, d_model) tensor and do something similar
+
+        # i'm just not sure how to do either of these efficiently
+
+        # maybe need to think bigger picture
+        # we have some tokens that we have gathered into a jagged tensor
+        # we have sent this jagged tensor through an FFN
+        # we want to un-nest this tensor back into the original shape
+        # the problem is that we constructed the tensor per-expert (probs[:, expert])
+        # i guess we could do the reverse
+        # make a (b t active) c empty tensor
+        # take our per-expert indices
+        # these are guaranteed not to contain duplicates
+        
+        # then we can do out[idx] = out[idx] + group * gate
+
+        # how to get gates?
+
+        # we have idx
+        # torch.gather(G, idx, dim=-1) -> (B, T, active)
+        # then rearrange to (B T, active)
+        # but this is bad bc we are going by expert
+        # how to know which gate is for the given expert?
+
+        # =========================================================
+        # gates = torch.tensor([[0, 0.5, 0.5],
+        #                      [0.9, 0.1, 0],
+        #                      [0.6, 0, 0.4]])
+
+        # group_indices = torch.tensor([0, 1])
+
+        # idx = torch.tensor([[1, 2],
+        #                   [0, 1],
+        #                   [2, 0]])
+
+        # expert = 2
+
+        # print(torch.gather(gates, -1, idx))
+        # tensor([[0.5000, 0.5000],
+        #         [0.9000, 0.1000],
+        #         [0.4000, 0.6000]])
+        # print(torch.gather(gates, -1, idx)[group_indices][idx[group_indices]==expert])
+        # tensor([0.5000])
+        # =========================================================
+
+
+        out = torch.empty(B * T, C)
+
+        gates = torch.gather(G, -1, idx)
+        
+        for group_indices, (expert, group) in zip(indices, enumerate(mlp_outs.unbind())):
+            group_gates = gates[group_indices][idx[group_indices]==expert]
+
+            out[group_indices] = out[group_indices] + group * group_gates
+
+        return rearrange(out, "(b t) c -> b t c", b=B, t=T)
 
 
 
@@ -168,7 +335,7 @@ def main() -> None:
     print("decoder block shapes correct")
 
     moe = MoE(8, 2, 64, 128, 64)
-    assert moe(torch.randn(2, 4, 64)).size() == (2, 4, 64)
+    assert moe(torch.randn(4, 12, 64)).size() == (4, 12, 64)
     print("moe shapes correct")
 
     gpt = GPT(vocab_size=14, d_model=20*16, n_heads=16, n_layers=12)
