@@ -2,9 +2,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, einsum, repeat
+from dataclasses import dataclass
+
+
+@dataclass
+class MoEConfig:
+    num_experts: int = 8
+    num_active: int = 2
+
+
+@dataclass
+class ModelConfig:
+    vocab_size: int = 256
+    d_model: int = 768
+    n_heads: int = 12
+    n_layers: int = 12
+    moe: bool = False
+    moe_config: MoEConfig | None = None
+
 
 def norm(x: torch.Tensor) -> torch.Tensor:
     return F.rms_norm(x, (x.size(-1),))
+
 
 class RoPE(nn.Module):
     def __init__(self, d: int, base: float = 10000):
@@ -22,11 +41,18 @@ class RoPE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, h, l, d = x.size()
 
-        position_angles = einsum(torch.arange(l, device=x.device), self.angles, "t, d -> t d").unsqueeze(0).unsqueeze(0)
+        position_angles = (
+            einsum(torch.arange(l, device=x.device), self.angles, "t, d -> t d")
+            .unsqueeze(0)
+            .unsqueeze(0)
+        )
 
-        x_shuffled = torch.stack([-x[:, :, :, 1::2], x[:, :, :, ::2]], dim=-1).flatten(-2)
+        x_shuffled = torch.stack([-x[:, :, :, 1::2], x[:, :, :, ::2]], dim=-1).flatten(
+            -2
+        )
 
         return x * torch.cos(position_angles) + x_shuffled * torch.sin(position_angles)
+
 
 class SelfAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int):
@@ -43,13 +69,18 @@ class SelfAttentionBlock(nn.Module):
         self.rope = RoPE(d_model // n_heads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        Q = self.rope(norm(rearrange(self.wq(x), "b t (h d) -> b h t d", h=self.n_heads)))
-        K = self.rope(norm(rearrange(self.wk(x), "b t (h d) -> b h t d", h=self.n_heads)))
+        Q = self.rope(
+            norm(rearrange(self.wq(x), "b t (h d) -> b h t d", h=self.n_heads))
+        )
+        K = self.rope(
+            norm(rearrange(self.wk(x), "b t (h d) -> b h t d", h=self.n_heads))
+        )
         V = rearrange(self.wv(x), "b t (h d) -> b h t d", h=self.n_heads)
 
         attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
         return self.wo(rearrange(attn_out, "b h t d -> b t (h d)"))
+
 
 class SwiGLU(nn.Module):
     def __init__(self, d_in: int, d_h: int, d_out: int):
@@ -66,20 +97,20 @@ class SwiGLU(nn.Module):
         o = self.W(x)
         return self.W2((o * F.sigmoid(o)) * self.V(x))
 
+
 class MoE(nn.Module):
-    def __init__(self, num_experts: int, num_active: int, d_in: int, d_h: int, d_out: int):
+    def __init__(self, config: MoEConfig, d_in: int, d_h: int, d_out: int):
         super().__init__()
-        self.num_experts = num_experts
-        self.num_active = num_active
+        self.config = config
         self.d_in = d_in
         self.d_h = d_h
         self.d_out = d_out
 
-        self.WG = nn.Linear(d_in, num_experts)
-        self.WN = nn.Linear(d_in, num_experts)
+        self.WG = nn.Linear(d_in, config.num_experts)
+        self.WN = nn.Linear(d_in, config.num_experts)
 
-        self.W1 = nn.Parameter(torch.randn(num_experts, d_in, d_h))
-        self.W2 = nn.Parameter(torch.randn(num_experts, d_h, d_out))
+        self.W1 = nn.Parameter(torch.randn(config.num_experts, d_in, d_h))
+        self.W2 = nn.Parameter(torch.randn(config.num_experts, d_h, d_out))
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor, use_kernel=False) -> torch.Tensor:
@@ -101,11 +132,11 @@ class MoE(nn.Module):
 
         # but how to do this?
 
-        print(G)
+        # can we flatten G before idx?
 
+        G = rearrange(G, "b t a -> (b t) a")
 
-        idx = torch.topk(G, self.num_active).indices
-        print(idx)
+        idx = torch.topk(G, self.config.num_active).indices
 
         mask = torch.ones_like(G, device=x.device).bool()
         mask.scatter_(-1, idx, 0)
@@ -113,8 +144,6 @@ class MoE(nn.Module):
         G[mask] = float("-inf")
 
         probs = F.softmax(G, dim=-1)
-
-        probs = rearrange(probs, "b t n -> (b t) n")
 
         # now we have a sparse tensor of topk probs of shape (B x T x N)
 
@@ -124,23 +153,17 @@ class MoE(nn.Module):
 
         # not sure if things will be differentiable
 
-        print(probs)
-        print(probs.size())
-
-
         jagged = []
         indices = []
 
         flattened_x = rearrange(x, "b t c -> (b t) c")
 
-        for expert in range(self.num_experts):
+        for expert in range(self.config.num_experts):
             expert_indices = torch.nonzero(probs[:, expert]).squeeze(-1)
             jagged.append(flattened_x[expert_indices])
             indices.append(expert_indices)
 
         grouped = torch.nested.nested_tensor(jagged, layout=torch.jagged)
-
-        print(grouped, grouped.size())
 
         # ok good. now we have a group tensor of shape (num_experts, j1, d_model)
         # where j1 represents the tokens per expert
@@ -149,21 +172,12 @@ class MoE(nn.Module):
         # ooh https://docs.pytorch.org/docs/2.14/generated/torch.nn.functional.grouped_mm.html
         # need to make sure we cast to bf16 and have >= 80 SMs
 
-
         if use_kernel:
             l1preact = F.grouped_mm(grouped, self.W1)
             mlp_outs = F.grouped_mm(self.act(l1preact), self.W2)
         else:
             l1preact = grouped @ self.W1
             mlp_outs = self.act(l1preact) @ self.W2
-
-        print(l1preact.size())
-        print(mlp_outs.size())
-
-
-        print(indices)
-
-        flattened_gates = rearrange(G, "b t n -> (b t) n")
 
         # now we have mlp outs in shape (num_experts, j1, d_model)
         # we must rearrange to (B, T, d_model) given the previous indices
@@ -185,14 +199,11 @@ class MoE(nn.Module):
         # seems like the play is to either use some hidden built-in function
         # or to use .values and .offsets of the jagged tensor
 
-        print(grouped.values(), grouped.values().size())
-
         # it looks like if we use .values, we get a tensor of size (B * T * active_experts, d_model)
         # this is very good (assuming we can backward through it all, which looks like yes)
         # it would be nice if we could use scatter, but we need to multiply by gates and sum
         # across experts first. we could concatenate the indices and use them as an index tensor
         # to sort the values with
-
 
         # if we have some tokens per expert
         # [[t2 t7 t1 t4]
@@ -204,7 +215,7 @@ class MoE(nn.Module):
 
         # we have idx
         # [ 2  7  1  4  6  5  0  3  2  3  8  4]
-        
+
         # what if we construct an empty out tensor
         # then do out[idx] = values
 
@@ -234,7 +245,7 @@ class MoE(nn.Module):
         # make a (b t active) c empty tensor
         # take our per-expert indices
         # these are guaranteed not to contain duplicates
-        
+
         # then we can do out[idx] = out[idx] + group * gate
 
         # how to get gates?
@@ -266,48 +277,74 @@ class MoE(nn.Module):
         # tensor([0.5000])
         # =========================================================
 
-
         out = torch.empty(B * T, C)
 
-        gates = torch.gather(G, -1, idx)
-        
-        for group_indices, (expert, group) in zip(indices, enumerate(mlp_outs.unbind())):
-            group_gates = gates[group_indices][idx[group_indices]==expert]
+        gates = torch.gather(probs, dim=-1, index=idx)
 
+        # bro i genuinely don't even know what i did here. it's probably wrong.
+        # essentially un-nests the nested mlp output tensor
+        # for each expert group, we find the gates (given the indices saved from earlier)
+        # then just add to the entry in out
+        # this is doable because inside each group there are no duplicate indices
+        for group_indices, (expert, group) in zip(
+            indices, enumerate(mlp_outs.unbind())
+        ):
+            group_gates = gates[group_indices][idx[group_indices] == expert].unsqueeze(
+                -1
+            )
             out[group_indices] = out[group_indices] + group * group_gates
 
         return rearrange(out, "(b t) c -> b t c", b=B, t=T)
 
 
-
 class DecoderBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        moe: bool = False,
+        moe_config: MoEConfig | None = None,
+    ):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
 
         self.mha = SelfAttentionBlock(d_model=d_model, n_heads=n_heads)
-        self.mlp = SwiGLU(d_in=d_model, d_h=d_model*4, d_out=d_model)
+        self.mlp = (
+            MoE(moe_config, d_in=d_model, d_h=d_model * 4, d_out=d_model)
+            if moe
+            else SwiGLU(d_in=d_model, d_h=d_model * 4, d_out=d_model)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.mha(norm(x))
         x = x + self.mlp(norm(x))
         return x
 
+
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int, n_heads: int, n_layers: int):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.n_layers = n_layers
+        self.config = config
 
-        self.emb = nn.Embedding(vocab_size, d_model)
+        self.emb = nn.Embedding(config.vocab_size, config.d_model)
 
-        self.blocks = nn.ModuleList([DecoderBlock(d_model=d_model, n_heads=n_heads) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList(
+            [
+                DecoderBlock(
+                    d_model=config.d_model,
+                    n_heads=config.n_heads,
+                    moe=config.moe,
+                    moe_config=config.moe_config,
+                )
+                for _ in range(config.n_layers)
+            ]
+        )
 
-        self.out_proj = nn.Linear(d_model, vocab_size, bias=False)
-        nn.init.normal_(self.out_proj.weight, mean=0.0, std=0.02 * (2 * self.n_layers) ** -0.5)
+        self.out_proj = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        nn.init.normal_(
+            self.out_proj.weight, mean=0.0, std=0.02 * (2 * config.n_layers) ** -0.5
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.emb(x)
@@ -316,6 +353,7 @@ class GPT(nn.Module):
             x = layer(x)
 
         return self.out_proj(x)
+
 
 def main() -> None:
     rope = RoPE(16)
@@ -326,7 +364,7 @@ def main() -> None:
     assert mha(torch.randn(2, 4, 128)).size() == (2, 4, 128)
     print("mha shapes correct")
 
-    mlp = SwiGLU(32, 32*4, 32)
+    mlp = SwiGLU(32, 32 * 4, 32)
     assert mlp(torch.randn(2, 4, 32)).size() == (2, 4, 32)
     print("mlp shapes correct")
 
@@ -334,14 +372,20 @@ def main() -> None:
     assert db(torch.randn(2, 4, 128)).size() == (2, 4, 128)
     print("decoder block shapes correct")
 
-    moe = MoE(8, 2, 64, 128, 64)
+    moe = MoE(MoEConfig(8, 2), 64, 128, 64)
     assert moe(torch.randn(4, 12, 64)).size() == (4, 12, 64)
     print("moe shapes correct")
 
-    gpt = GPT(vocab_size=14, d_model=20*16, n_heads=16, n_layers=12)
+    gpt = GPT(ModelConfig(14, 64, 16, 12))
     assert gpt(torch.randint(0, 14, (2, 8))).size() == (2, 8, 14)
+    print("gpt moe shapes correct")
+    print("gpt moe parameters:", sum(p.numel() for p in gpt.parameters()))
+
+    gpt_moe = GPT(ModelConfig(14, 64, 16, 12, True, MoEConfig(8, 2)))
+    assert gpt_moe(torch.randint(0, 14, (2, 8))).size() == (2, 8, 14)
     print("gpt shapes correct")
     print("gpt parameters:", sum(p.numel() for p in gpt.parameters()))
+
 
 if __name__ == "__main__":
     main()
