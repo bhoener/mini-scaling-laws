@@ -22,7 +22,7 @@ class ModelConfig:
 
 
 def norm(x: torch.Tensor) -> torch.Tensor:
-    return F.rms_norm(x, (x.size(-1),))
+    return F.rms_norm(x, (x.size(-1),), eps=1e-7)
 
 
 class RoPE(nn.Module):
@@ -111,12 +111,19 @@ class MoE(nn.Module):
 
         self.W1 = nn.Parameter(torch.randn(config.num_experts, d_in, d_h))
         self.W2 = nn.Parameter(torch.randn(config.num_experts, d_h, d_out))
+
+        with torch.no_grad():
+            self.W1 /= d_in ** 0.5
+            self.W2 /= d_h ** 0.5
+
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor, use_kernel=False) -> torch.Tensor:
         B, T, C = x.size()
         G = self.WG(x)
         G = G + torch.randn_like(G, device=x.device) * F.softplus(self.WN(x))
+
+        
 
         # we want to group tokens into batches and send those groups through their corresponding experts
         # probably best to flatten batch/time?
@@ -144,6 +151,8 @@ class MoE(nn.Module):
         G[mask] = float("-inf")
 
         probs = F.softmax(G, dim=-1)
+
+        
 
         # now we have a sparse tensor of topk probs of shape (B x T x N)
 
@@ -277,7 +286,10 @@ class MoE(nn.Module):
         # tensor([0.5000])
         # =========================================================
 
-        out = torch.empty(B * T, C)
+        # went down a very long rabbit hole of debugging to realize:
+        # 1) forgot to 1/sqrt(fan_in) initialize my mlp layers
+        # 2) forgot that i'm adding and not assigning to out so can't use torch.empty()
+        out = torch.zeros(B * T, C)
 
         gates = torch.gather(probs, dim=-1, index=idx)
 
@@ -286,13 +298,16 @@ class MoE(nn.Module):
         # for each expert group, we find the gates (given the indices saved from earlier)
         # then just add to the entry in out
         # this is doable because inside each group there are no duplicate indices
+
         for group_indices, (expert, group) in zip(
             indices, enumerate(mlp_outs.unbind())
         ):
-            group_gates = gates[group_indices][idx[group_indices] == expert].unsqueeze(
-                -1
-            )
-            out[group_indices] = out[group_indices] + group * group_gates
+            if len(group_indices > 0):
+                group_gates = gates[group_indices][idx[group_indices] == expert].unsqueeze(
+                    -1
+                )
+            
+                out[group_indices] = out[group_indices] + group * group_gates
 
         return rearrange(out, "(b t) c -> b t c", b=B, t=T)
 
@@ -378,13 +393,13 @@ def main() -> None:
 
     gpt = GPT(ModelConfig(14, 64, 16, 12))
     assert gpt(torch.randint(0, 14, (2, 8))).size() == (2, 8, 14)
-    print("gpt moe shapes correct")
-    print("gpt moe parameters:", sum(p.numel() for p in gpt.parameters()))
+    print("gpt shapes correct")
+    print("gpt parameters:", sum(p.numel() for p in gpt.parameters()))
 
     gpt_moe = GPT(ModelConfig(14, 64, 16, 12, True, MoEConfig(8, 2)))
     assert gpt_moe(torch.randint(0, 14, (2, 8))).size() == (2, 8, 14)
-    print("gpt shapes correct")
-    print("gpt parameters:", sum(p.numel() for p in gpt.parameters()))
+    print("gpt moe shapes correct")
+    print("gpt moe parameters:", sum(p.numel() for p in gpt_moe.parameters()))
 
 
 if __name__ == "__main__":

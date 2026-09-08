@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from model import GPT
+from model import GPT, ModelConfig, MoEConfig
 from train import train
 from copy import deepcopy
 import time
@@ -25,7 +25,8 @@ def main() -> None:
         "lr_muon": 3e-4,
         "cooldown_frac": 0.2,
         "moe": False,
-        "moe_experts": 32,
+        "moe_experts": 8,
+        "moe_active": 2,
     }
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -34,27 +35,34 @@ def main() -> None:
     losses = []
     group_name = f"head-dim-{int(time.time())}"
     for head_dim in head_dims:
-        cfg = deepcopy(DEFAULT_CONFIG)
-        cfg["head_dim"] = head_dim
-        run = wandb.init(project="MiniScalingLaws", config=cfg, group=group_name)
-        model = GPT(
-            vocab_size=cfg["vocab_size"],
-            d_model=cfg["head_dim"] * cfg["n_heads"],
-            n_heads=cfg["n_heads"],
-            n_layers=cfg["n_layers"],
+        train_cfg = deepcopy(DEFAULT_CONFIG)
+        train_cfg["head_dim"] = head_dim
+        cfg = ModelConfig(
+            vocab_size=DEFAULT_CONFIG["vocab_size"],
+            d_model=head_dim * DEFAULT_CONFIG["n_heads"],
+            n_heads=DEFAULT_CONFIG["n_heads"],
+            n_layers=DEFAULT_CONFIG["n_layers"],
+            moe=DEFAULT_CONFIG["moe"],
+            moe_config=MoEConfig(
+                num_experts=DEFAULT_CONFIG["moe_experts"],
+                num_active=DEFAULT_CONFIG["moe_active"],
+            ),
         )
+
+        run = wandb.init(project="MiniScalingLaws", config=train_cfg, group=group_name)
+        model = GPT(cfg)
         model = model.to(device)
         model = torch.compile(model, mode="reduce-overhead")
 
         train_loss = train(
             "data/",
             model=model,
-            steps=cfg["steps"],
-            bsz=cfg["batch_size"],
-            seq_len=cfg["seq_len"],
-            lr_adamw=cfg["lr_adamw"],
-            lr_muon=cfg["lr_muon"],
-            cooldown_frac=cfg["cooldown_frac"],
+            steps=train_cfg["steps"],
+            bsz=train_cfg["batch_size"],
+            seq_len=train_cfg["seq_len"],
+            lr_adamw=train_cfg["lr_adamw"],
+            lr_muon=train_cfg["lr_muon"],
+            cooldown_frac=train_cfg["cooldown_frac"],
             logging=True,
             device=device,
             wandb_run=run,
