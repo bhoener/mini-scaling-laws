@@ -6,6 +6,26 @@ from dataloader import DataLoader
 import wandb
 
 
+def get_flops_per_token(model: GPT) -> int:
+    d_model = model.config.d_model
+    embedding_params = d_model * model.config.vocab_size
+    ffn_params = (
+        d_model * d_model * 4 * model.config.moe_config.num_experts * 2
+        + d_model * model.config.moe_config.num_experts * 2
+        if model.config.moe
+        else model.config.d_model * model.config.d_model * 4 * 3
+    )
+
+    ffn_active_params = (
+        d_model * d_model * 4 * model.config.moe_config.num_active * 2
+        + d_model * model.config.moe_config.num_experts * 2
+        if model.config.moe
+        else model.config.d_model * model.config.d_model * 4 * 3
+    )
+
+    return 6 * (sum(p.numel() for p in model.parameters()) - embedding_params - ffn_params + ffn_active_params)
+
+
 def train(
     train_filepath: str,
     model: GPT,
@@ -24,18 +44,27 @@ def train(
 
     params = sum(p.numel() for p in model.parameters())
 
-    optim_adamw = torch.optim.AdamW([p for p in model.parameters() if p.ndim != 2], lr=lr_adamw, fused=True)
-    optim_muon = torch.optim.AdamW([p for p in model.parameters() if p.ndim == 2], lr=lr_muon)
+    optim_adamw = torch.optim.AdamW(
+        [p for p in model.parameters() if p.ndim != 2], lr=lr_adamw, fused=True
+    )
+    optim_muon = torch.optim.AdamW(
+        [p for p in model.parameters() if p.ndim == 2], lr=lr_muon
+    )
 
-    def get_lr(it: int, lr_base: float, cooldown_frac: float, total_steps: int) -> float:
+    def get_lr(
+        it: int, lr_base: float, cooldown_frac: float, total_steps: int
+    ) -> float:
         progress = it / total_steps
         if progress < (1 - cooldown_frac):
             return lr_base
 
-        cooldown_progress = (it - (total_steps * (1 - cooldown_frac))) / (total_steps * cooldown_frac)
+        cooldown_progress = (it - (total_steps * (1 - cooldown_frac))) / (
+            total_steps * cooldown_frac
+        )
         return (1 - cooldown_progress) * lr_base
 
     total_flops = 0
+    flops_per_token = get_flops_per_token(model)
 
     for step in range(steps):
         xs, ys = train_dl.next()
@@ -50,18 +79,29 @@ def train(
         loss.backward()
 
         for param_group in optim_adamw.param_groups:
-            param_group["lr"] = get_lr(step, optim_adamw.defaults["lr"], cooldown_frac, steps)
+            param_group["lr"] = get_lr(
+                step, optim_adamw.defaults["lr"], cooldown_frac, steps
+            )
         for param_group in optim_muon.param_groups:
-            param_group["lr"] = get_lr(step, optim_muon.defaults["lr"], cooldown_frac, steps)
+            param_group["lr"] = get_lr(
+                step, optim_muon.defaults["lr"], cooldown_frac, steps
+            )
 
         norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
         optim_adamw.step()
         optim_muon.step()
 
-        total_flops += 6 * params * xs.numel()
+        total_flops += flops_per_token * xs.numel()
 
-        wandb_run.log({"train_loss": loss.item(), "norm": norm.item(), "total_flops": total_flops, "lr_mult": get_lr(step, 1.0, cooldown_frac, steps)})
+        wandb_run.log(
+            {
+                "train_loss": loss.item(),
+                "norm": norm.item(),
+                "total_flops": total_flops,
+                "lr_mult": get_lr(step, 1.0, cooldown_frac, steps),
+            }
+        )
 
         if logging and step % log_every == 0:
             print(f"step: {step:8d} | loss: {loss:8.4f} | norm: {norm:8.4f}")
@@ -70,11 +110,13 @@ def train(
 
     return loss.item()
 
+
 def main() -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     gpt = GPT(vocab_size=14, d_model=512, n_heads=16, n_layers=12).to(device)
 
     print(train("numbers.npy", "numbers_val.npy", gpt, 1000, 16, device=device))
+
 
 if __name__ == "__main__":
     main()

@@ -106,8 +106,11 @@ class MoE(nn.Module):
         self.d_h = d_h
         self.d_out = d_out
 
-        self.WG = nn.Linear(d_in, config.num_experts)
-        self.WN = nn.Linear(d_in, config.num_experts)
+        self.WG = nn.Linear(d_in, config.num_experts, bias=False)
+        self.WN = nn.Linear(d_in, config.num_experts, bias=False)
+
+        nn.init.zeros_(self.WG.weight)
+        nn.init.zeros_(self.WN.weight)
 
         self.W1 = nn.Parameter(torch.randn(config.num_experts, d_in, d_h))
         self.W2 = nn.Parameter(torch.randn(config.num_experts, d_h, d_out))
