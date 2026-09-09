@@ -116,17 +116,16 @@ class MoE(nn.Module):
         self.W2 = nn.Parameter(torch.randn(config.num_experts, d_h, d_out))
 
         with torch.no_grad():
-            self.W1 /= d_in ** 0.5
-            self.W2 /= d_h ** 0.5
+            self.W1 /= d_in**0.5
+            self.W2 /= d_h**0.5
 
         self.act = nn.SiLU()
 
-    def forward(self, x: torch.Tensor, use_kernel=False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, use_kernel=False) -> tuple[torch.Tensor, ...]:
         B, T, C = x.size()
-        G = self.WG(x)
-        G = G + torch.randn_like(G, device=x.device) * F.softplus(self.WN(x))
-
-        
+        xWg = self.WG(x)
+        noise_weights = F.softplus(self.WN(x))
+        H = xWg + torch.randn_like(xWg, device=x.device) * noise_weights
 
         # we want to group tokens into batches and send those groups through their corresponding experts
         # probably best to flatten batch/time?
@@ -144,18 +143,18 @@ class MoE(nn.Module):
 
         # can we flatten G before idx?
 
-        G = rearrange(G, "b t a -> (b t) a")
+        H = rearrange(H, "b t a -> (b t) a")
 
-        idx = torch.topk(G, self.config.num_active).indices
+        top_k = torch.topk(H, self.config.num_active)
+        idx = top_k.indices
+        kth_highest = rearrange(torch.amin(top_k.values, dim=-1, keepdim=True), "(b t) a -> b t a", b=B, t=T)
 
-        mask = torch.ones_like(G, device=x.device).bool()
+        mask = torch.ones_like(H, device=x.device).bool()
         mask.scatter_(-1, idx, 0)
 
-        G[mask] = float("-inf")
+        H[mask] = float("-inf")
 
-        probs = F.softmax(G, dim=-1)
-
-        
+        G = F.softmax(H, dim=-1)
 
         # now we have a sparse tensor of topk probs of shape (B x T x N)
 
@@ -171,7 +170,7 @@ class MoE(nn.Module):
         flattened_x = rearrange(x, "b t c -> (b t) c")
 
         for expert in range(self.config.num_experts):
-            expert_indices = torch.nonzero(probs[:, expert]).squeeze(-1)
+            expert_indices = torch.nonzero(G[:, expert]).squeeze(-1)
             jagged.append(flattened_x[expert_indices])
             indices.append(expert_indices)
 
@@ -294,7 +293,7 @@ class MoE(nn.Module):
         # 2) forgot that i'm adding and not assigning to out so can't use torch.empty()
         out = torch.zeros(B * T, C)
 
-        gates = torch.gather(probs, dim=-1, index=idx)
+        gates = torch.gather(G, dim=-1, index=idx)
 
         # bro i genuinely don't even know what i did here. it's probably wrong.
         # essentially un-nests the nested mlp output tensor
@@ -306,13 +305,21 @@ class MoE(nn.Module):
             indices, enumerate(mlp_outs.unbind())
         ):
             if len(group_indices > 0):
-                group_gates = gates[group_indices][idx[group_indices] == expert].unsqueeze(
-                    -1
-                )
-            
+                group_gates = gates[group_indices][
+                    idx[group_indices] == expert
+                ].unsqueeze(-1)
+
                 out[group_indices] = out[group_indices] + group * group_gates
 
-        return rearrange(out, "(b t) c -> b t c", b=B, t=T)
+        importance = G.sum(0, keepdim=True).unsqueeze(0)
+        importance_loss = (importance.std() / importance.mean()) ** 2
+
+        load = (
+            0.5 * (1 + torch.erf(xWg - kth_highest / (2**0.5 * noise_weights)))
+        ).sum((0, 1))
+        load_loss = (load.std() / load.mean()) ** 2
+
+        return rearrange(out, "(b t) c -> b t c", b=B, t=T), importance_loss, load_loss
 
 
 class DecoderBlock(nn.Module):
@@ -326,6 +333,7 @@ class DecoderBlock(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
+        self.moe = moe
 
         self.mha = SelfAttentionBlock(d_model=d_model, n_heads=n_heads)
         self.mlp = (
@@ -334,10 +342,17 @@ class DecoderBlock(nn.Module):
             else SwiGLU(d_in=d_model, d_h=d_model * 4, d_out=d_model)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         x = x + self.mha(norm(x))
-        x = x + self.mlp(norm(x))
-        return x
+        if self.moe:
+            moe_out, importance_loss, load_loss = self.mlp(norm(x))
+            x = x + moe_out
+            return x, importance_loss, load_loss
+        else:
+            x = x + self.mlp(norm(x))
+            return x
 
 
 class GPT(nn.Module):
@@ -368,9 +383,24 @@ class GPT(nn.Module):
         x = self.emb(x)
 
         for layer in self.blocks:
-            x = layer(x)
+            if self.config.moe:
+                importance_loss_accum = 0.0
+                load_loss_accum = 0.0
 
-        return self.out_proj(x)
+                x, importance_loss, load_loss = layer(x)
+                importance_loss_accum = importance_loss_accum + importance_loss
+                load_loss_accum = load_loss_accum + load_loss
+            else:
+                x = layer(x)
+
+        if self.config.moe:
+            return (
+                self.out_proj(x),
+                importance_loss_accum / self.config.n_layers,
+                load_loss_accum / self.config.n_layers,
+            )
+        else:
+            return self.out_proj(x)
 
 
 def main() -> None:
@@ -391,7 +421,7 @@ def main() -> None:
     print("decoder block shapes correct")
 
     moe = MoE(MoEConfig(8, 2), 64, 128, 64)
-    assert moe(torch.randn(4, 12, 64)).size() == (4, 12, 64)
+    assert moe(torch.randn(4, 12, 64))[0].size() == (4, 12, 64)
     print("moe shapes correct")
 
     gpt = GPT(ModelConfig(14, 64, 16, 12))
@@ -400,7 +430,7 @@ def main() -> None:
     print("gpt parameters:", sum(p.numel() for p in gpt.parameters()))
 
     gpt_moe = GPT(ModelConfig(14, 64, 16, 12, True, MoEConfig(8, 2)))
-    assert gpt_moe(torch.randint(0, 14, (2, 8))).size() == (2, 8, 14)
+    assert gpt_moe(torch.randint(0, 14, (2, 8)))[0].size() == (2, 8, 14)
     print("gpt moe shapes correct")
     print("gpt moe parameters:", sum(p.numel() for p in gpt_moe.parameters()))
 

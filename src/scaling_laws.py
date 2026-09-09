@@ -54,7 +54,7 @@ def main() -> None:
             run = wandb.init(project="MiniScalingLaws", config=train_cfg, group=group_name)
             model = GPT(cfg)
             model = model.to(device)
-            model = torch.compile(model, mode="reduce-overhead")
+            #model = torch.compile(model, mode="reduce-overhead")
 
             train_loss = train(
                 "data/",

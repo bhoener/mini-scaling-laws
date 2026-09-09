@@ -23,7 +23,12 @@ def get_flops_per_token(model: GPT) -> int:
         else model.config.d_model * model.config.d_model * 4 * 3
     )
 
-    return 6 * (sum(p.numel() for p in model.parameters()) - embedding_params - ffn_params + ffn_active_params)
+    return 6 * (
+        sum(p.numel() for p in model.parameters())
+        - embedding_params
+        - ffn_params
+        + ffn_active_params
+    )
 
 
 def train(
@@ -37,6 +42,8 @@ def train(
     cooldown_frac: float = 0.2,
     logging: bool = True,
     log_every: int = 10,
+    importance_loss_weight: float = 0.1,
+    load_loss_weight: float = 0.1,
     device: torch.device | None = None,
     wandb_run: wandb.Run | None = None,
 ) -> tuple[float, float]:
@@ -69,9 +76,15 @@ def train(
     for step in range(steps):
         xs, ys = train_dl.next()
 
-        pred = model(xs)
-
-        loss = F.cross_entropy(pred.view(-1, pred.size(-1)), ys.view(-1))
+        if model.config.moe:
+            pred, importance_loss, load_loss = model(xs)
+            loss = (
+                F.cross_entropy(pred.view(-1, pred.size(-1)), ys.view(-1))
+                + importance_loss * importance_loss_weight
+                + load_loss * load_loss_weight
+            )
+        else:
+            pred = model(xs)
 
         optim_adamw.zero_grad()
         optim_muon.zero_grad()
@@ -96,6 +109,15 @@ def train(
 
         wandb_run.log(
             {
+                "train_loss": loss.item(),
+                "importance_loss": importance_loss.item(),
+                "load_loss": load_loss.item(),
+                "norm": norm.item(),
+                "total_flops": total_flops,
+                "lr_mult": get_lr(step, 1.0, cooldown_frac, steps),
+            }
+            if model.config.moe
+            else {
                 "train_loss": loss.item(),
                 "norm": norm.item(),
                 "total_flops": total_flops,
