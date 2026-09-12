@@ -85,6 +85,7 @@ def train(
             )
         else:
             pred = model(xs)
+            loss = F.cross_entropy(pred.view(-1, pred.size(-1)), ys.view(-1))
 
         optim_adamw.zero_grad()
         optim_muon.zero_grad()

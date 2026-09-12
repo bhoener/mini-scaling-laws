@@ -291,7 +291,7 @@ class MoE(nn.Module):
         # went down a very long rabbit hole of debugging to realize:
         # 1) forgot to 1/sqrt(fan_in) initialize my mlp layers
         # 2) forgot that i'm adding and not assigning to out so can't use torch.empty()
-        out = torch.zeros(B * T, C)
+        out = torch.zeros(B * T, C, device=x.device)
 
         gates = torch.gather(G, dim=-1, index=idx)
 
@@ -404,33 +404,35 @@ class GPT(nn.Module):
 
 
 def main() -> None:
-    rope = RoPE(16)
-    assert rope(torch.randn(2, 4, 32, 16)).size() == (2, 4, 32, 16)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    rope = RoPE(16).to(device)
+    assert rope(torch.randn(2, 4, 32, 16, device=device)).size() == (2, 4, 32, 16)
     print("rope shapes correct")
 
-    mha = SelfAttentionBlock(128, 16)
-    assert mha(torch.randn(2, 4, 128)).size() == (2, 4, 128)
+    mha = SelfAttentionBlock(128, 16).to(device)
+    assert mha(torch.randn(2, 4, 128, device=device)).size() == (2, 4, 128)
     print("mha shapes correct")
 
-    mlp = SwiGLU(32, 32 * 4, 32)
-    assert mlp(torch.randn(2, 4, 32)).size() == (2, 4, 32)
+    mlp = SwiGLU(32, 32 * 4, 32).to(device)
+    assert mlp(torch.randn(2, 4, 32, device=device)).size() == (2, 4, 32)
     print("mlp shapes correct")
 
-    db = DecoderBlock(128, 16)
-    assert db(torch.randn(2, 4, 128)).size() == (2, 4, 128)
+    db = DecoderBlock(128, 16).to(device)
+    assert db(torch.randn(2, 4, 128, device=device)).size() == (2, 4, 128)
     print("decoder block shapes correct")
 
-    moe = MoE(MoEConfig(8, 2), 64, 128, 64)
-    assert moe(torch.randn(4, 12, 64))[0].size() == (4, 12, 64)
+    moe = MoE(MoEConfig(8, 2), 64, 128, 64).to(device)
+    assert moe(torch.randn(4, 12, 64, device=device))[0].size() == (4, 12, 64)
     print("moe shapes correct")
 
-    gpt = GPT(ModelConfig(14, 64, 16, 12))
-    assert gpt(torch.randint(0, 14, (2, 8))).size() == (2, 8, 14)
+    gpt = GPT(ModelConfig(14, 64, 16, 12)).to(device)
+    assert gpt(torch.randint(0, 14, (2, 8), device=device)).size() == (2, 8, 14)
     print("gpt shapes correct")
     print("gpt parameters:", sum(p.numel() for p in gpt.parameters()))
 
-    gpt_moe = GPT(ModelConfig(14, 64, 16, 12, True, MoEConfig(8, 2)))
-    assert gpt_moe(torch.randint(0, 14, (2, 8)))[0].size() == (2, 8, 14)
+    gpt_moe = GPT(ModelConfig(14, 64, 16, 12, True, MoEConfig(8, 2))).to(device)
+    assert gpt_moe(torch.randint(0, 14, (2, 8), device=device))[0].size() == (2, 8, 14)
     print("gpt moe shapes correct")
     print("gpt moe parameters:", sum(p.numel() for p in gpt_moe.parameters()))
 
