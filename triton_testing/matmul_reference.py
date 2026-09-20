@@ -364,4 +364,4 @@ if __name__ == "__main__":
     # Only run benchmark if explicitly requested
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
-        benchmark.run(save_path='.', print_data=False)
+        benchmark.run(save_path='.', print_data=True)
