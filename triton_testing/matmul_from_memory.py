@@ -55,15 +55,15 @@ def matmul_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
-    M: int,
-    K: int,
-    N: int,
-    a_stride_M: int,
-    a_stride_K: int,
-    b_stride_K: int,
-    b_stride_N: int,
-    c_stride_M: int,
-    c_stride_N: int,
+    M,
+    K,
+    N,
+    a_stride_M,
+    a_stride_K,
+    b_stride_K,
+    b_stride_N,
+    c_stride_M,
+    c_stride_N,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -219,7 +219,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     a = a.to(torch.float16)
     b = b.to(torch.float16)
 
-    c = torch.empty(M, N, device=DEVICE, dtype=torch.float16)
+    c = torch.empty((M, N), device=DEVICE, dtype=torch.float16)
 
     grid = lambda meta: (
         triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]),
@@ -258,11 +258,6 @@ def test_matmul(
     print("PASSED")
 
 
-if __name__ == "__main__":
-    print("using device", DEVICE)
-    test_matmul(1024, 1024, 1024)
-
-
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["M", "N", "K"],
@@ -278,8 +273,8 @@ if __name__ == "__main__":
     )
 )
 def benchmark(M: int, N: int, K: int, provider: str) -> tuple[float, ...]:
-    a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
-    b = torch.randn(K, N, device=DEVICE, dtype=torch.float16) / (K**0.5)
+    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16) / (K**0.5)
 
     quantiles = [0.5, 0.2, 0.8]
 
@@ -297,4 +292,7 @@ def benchmark(M: int, N: int, K: int, provider: str) -> tuple[float, ...]:
     return tflops(ms), tflops(min_ms), tflops(max_ms)
 
 
-benchmark.run(show_plots=False, print_data=True, save_path=".")
+if __name__ == "__main__":
+    print("using device", DEVICE)
+    test_matmul(1024, 1024, 1024)
+    benchmark.run(show_plots=False, print_data=True, save_path=".")

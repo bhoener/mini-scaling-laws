@@ -56,21 +56,26 @@ def matmul_kernel(
     x_ptr,
     y_ptr,
     out_ptr,
-    M: int,
-    K: int,
-    N: int,
-    x_row_stride: int,
-    x_col_stride: int,
-    y_row_stride: int,
-    y_col_stride: int,
-    out_row_stride: int,
-    out_col_stride: int,
+    M,
+    K,
+    N,
+    x_row_stride,
+    x_col_stride,
+    y_row_stride,
+    y_col_stride,
+    out_row_stride,
+    out_col_stride,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
 ):
     """
+
+    BRO WHAT !!!!!
+    ADDING TYPE ANNOTATIONS COMPLETELY NUKES PERFORMANCE
+
+
     M = N = K = 8
     BLOCK_SIZE_{M, K, N} = 2
     [0,  1,  2,  3]
