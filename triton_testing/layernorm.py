@@ -14,8 +14,33 @@ def _layernorm_forward(x_ptr, y_ptr, w_ptr, b_ptr, mean_ptr, rstd_ptr, stride_M,
         # load a single row of x
         cols = offset + tl.arange(0, BLOCK_SIZE)
         x = tl.load(x_ptr + cols, mask = cols < N, other=0.0).to(tl.float32)
+        sum_accumulator += x
+    mean = tl.sum(sum_accumulator, axis=0) / N
 
-        
+
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for offset in range(0, N, BLOCK_SIZE):
+        cols = offset + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(x_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+        diff = tl.where(cols < N, x - mean, 0.0)
+        acc += diff * diff
+
+    var = acc.sum(axis=0) / N
+    rstd = 1 / (var + eps).sqrt()
+
+    # store mean, rstd for backward
+    tl.store(mean_ptr + row, mean)
+    tl.store(rstd_ptr + row, rstd)
+
+    for offset in range(0, N, BLOCK_SIZE):
+        cols = offset + tl.arange(0, BLOCK_SIZE)
+        weight_block = tl.load(weight_ptr + cols, mask=cols < N, other=0.0)
+        bias_block = tl.load(bias_ptr + cols, mask=cols < N, other=0.0)
+        x_block = tl.load(x_ptr + cols, mask=cols < N, other=0.0)
+
+        x_shifted = (x_block - mean) * rstd * weight_block + bias_block
+
+        tl.store(y_ptr + cols, x_shifted, mask=cols < N)
 
 
 class LayerNorm(torch.autograd.Function):
@@ -47,7 +72,24 @@ class LayerNorm(torch.autograd.Function):
         ctx.eps = eps
 
     @staticmethod
-    def backward( ):
+    def backward(ctx, dLdy):
+        x, w, b, mean, rstd = ctx.saved_tensors
+        M, N = x.reshape(-1, x.size(-1)).shape
+
+        dLdx = torch.empty_like(x) # (M, N)
+        dLdw = torch.empty_like(w) # (N)
+        dLdb = torch.empty_like(b) # (N)
+
+        GROUP_SIZE = 64
+        if N <= 8192: GROUP_SIZE = 96
+        if N <= 4096: GROUP_SIZE = 128
+        if N <= 2048: GROUP_SIZE = 192
+        if N <= 1024: GROUP_SIZE = 256
+
+
+
+
+
 
 def test_layernorm_kernel(M: int, N: int, dtype: torch.dtype, eps: float = 1e-5, device=DEVICE):
     x = -2.3 + 0.5 * torch.randn((M, N), dtype=dtype, device=DEVICE)
