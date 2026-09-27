@@ -1,10 +1,23 @@
 import torch
 import triton
 import triton.language as tl
+
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+
 @triton.jit
-def _layernorm_forward(x_ptr, y_ptr, w_ptr, b_ptr, mean_ptr, rstd_ptr, stride_M, N, eps, BLOCK_SIZE: tl.constexpr):
+def _layernorm_forward(
+    x_ptr,
+    y_ptr,
+    w_ptr,
+    b_ptr,
+    mean_ptr,
+    rstd_ptr,
+    stride_M,
+    N,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
     row = tl.program_id(axis=0)
     x_ptr += row * stride_M
     y_ptr += row * stride_M
@@ -13,10 +26,9 @@ def _layernorm_forward(x_ptr, y_ptr, w_ptr, b_ptr, mean_ptr, rstd_ptr, stride_M,
     for offset in range(0, N, BLOCK_SIZE):
         # load a single row of x
         cols = offset + tl.arange(0, BLOCK_SIZE)
-        x = tl.load(x_ptr + cols, mask = cols < N, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
         sum_accumulator += x
     mean = tl.sum(sum_accumulator, axis=0) / N
-
 
     acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     for offset in range(0, N, BLOCK_SIZE):
@@ -48,8 +60,8 @@ class LayerNorm(torch.autograd.Function):
     def forward(ctx, x, normalized_shape, weight, bias, eps):
         M, N = x.reshape(-1, x.shape(-1)).shape
         y = torch.empty_like(x, device=DEVICE, dtype=torch.float32)
-        mean = torch.empty((M, ), device=DEVICE, dtype=torch.float32)
-        rstd = torch.empty((M, ), device=DEVICE, dtype=torch.float32)
+        mean = torch.empty((M,), device=DEVICE, dtype=torch.float32)
+        rstd = torch.empty((M,), device=DEVICE, dtype=torch.float32)
 
         MAX_FUSED_SIZE = 65536 // x.element_size()
         BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
@@ -60,8 +72,15 @@ class LayerNorm(torch.autograd.Function):
         num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
 
         _layernorm_forward[(M,)](
-            x, y, weight, bias, mean, rstd, 
-            x.stride(0), N, eps,
+            x,
+            y,
+            weight,
+            bias,
+            mean,
+            rstd,
+            x.stride(0),
+            N,
+            eps,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
@@ -76,22 +95,61 @@ class LayerNorm(torch.autograd.Function):
         x, w, b, mean, rstd = ctx.saved_tensors
         M, N = x.reshape(-1, x.size(-1)).shape
 
-        dLdx = torch.empty_like(x) # (M, N)
-        dLdw = torch.empty_like(w) # (N)
-        dLdb = torch.empty_like(b) # (N)
+        # initialize empty gradients
+        dLdx = torch.empty_like(x)  # (M, N)
+        dLdw = torch.empty_like(w)  # (N)
+        dLdb = torch.empty_like(b)  # (N)
 
         GROUP_SIZE = 64
-        if N <= 8192: GROUP_SIZE = 96
-        if N <= 4096: GROUP_SIZE = 128
-        if N <= 2048: GROUP_SIZE = 192
-        if N <= 1024: GROUP_SIZE = 256
+        if N <= 8192:
+            GROUP_SIZE = 96
+        if N <= 4096:
+            GROUP_SIZE = 128
+        if N <= 1024:
+            GROUP_SIZE = 256
 
+        # make intermediate tensors (why GROUP_SIZE, N?)
+        # is GROUP_SIZE the size of the reduced tensor?
+        dLdw_inter = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=x.device)
+        dLdb_inter = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=x.device)
 
+        locks = torch.zeros((2 * GROUP_SIZE,), dtype=torch.int32, device=x.device)
 
+        _layernorm_backward_dLdx[(rows,)](
+            x,
+            dLdx,
+            dLdy,
+            w,
+            dLdw_inter,
+            dLdb_inter,
+            rstd,
+            locks,
+            x.stride(0),
+            N,
+            GROUP_SIZE=GROUP_SIZE,
+            BLOCK_SIZE_N=ctx.BLOCK_SIZE,
+            num_warps=ctx.num_warps,
+        )
 
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
+        _layernorm_backward_dLdw_dLdb[grid](
+            dLdw_inter,
+            dLdb_inter,
+            dLdw,
+            dLdb,
+            min(GROUP_SIZE, M),
+            N,
+            BLOCK_SIZE_M=32,
+            BLOCK_SIZE_N=128,
+        )
 
+        return dLdx, None, dLdw, dLdb, None
 
-def test_layernorm_kernel(M: int, N: int, dtype: torch.dtype, eps: float = 1e-5, device=DEVICE):
+layernorm = LayerNorm.apply
+
+def test_layernorm_kernel(
+    M: int, N: int, dtype: torch.dtype, eps: float = 1e-5, device=DEVICE
+):
     x = -2.3 + 0.5 * torch.randn((M, N), dtype=dtype, device=DEVICE)
     x.requires_grad_(True)
     weight = torch.rand((N,), dtype=dtype, device=DEVICE, requires_grad=True)
