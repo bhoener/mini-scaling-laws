@@ -5,9 +5,8 @@ import triton.language as tl
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 cfgs = []
-for block_size in [512, 1024, 2048]:
-    for warps in [2, 4, 8]:
-        cfgs.append(triton.Config({"BLOCK_SIZE": block_size}, num_warps=warps))
+for warps in [2, 4, 8]:
+    cfgs.append(triton.Config(num_warps=warps))
 
 @triton.autotune(
     configs=cfgs, key={"M", "N"}
@@ -21,6 +20,8 @@ def _group_sum_kernel_1(in_ptr, intermediate_ptr, locks_ptr, M, N, GROUP_SIZE: t
     keep in mind that the name GROUP_SIZE is misleading.
     GROUP_SIZE is (M // ROWS_PER_GROUP)
 
+    our locks are of size (GROUP_SIZE * 2)
+
     ok so:
 
     for each row, we must find its corresponding row in the output
@@ -30,10 +31,42 @@ def _group_sum_kernel_1(in_ptr, intermediate_ptr, locks_ptr, M, N, GROUP_SIZE: t
     """
 
     row = tl.program_id(axis=0)
-    inter_row = row % GROUP_SIZE
+    intermediate_row = row % GROUP_SIZE
 
-    # now what
-    # need to look into atomic operations
+    row_start = row * N
+    offsets = tl.arange(0, BLOCK_SIZE_N)
+
+    mask = offsets < N
+
+    row_contribution = tl.load(in_ptr + row_start + offsets, mask=mask, other=0.0)
+
+
+    # so, looks like:
+    # we have a locks tensor
+    # it is (2 * GROUP_SIZE)
+    # containing (is_locked, has_been_accessed)
+
+    # if it is our first time accessing, we don't read the intermediate
+    # and just write
+    # but, if it is not our first time accessing,
+    # we add the current intermediate value to our contribution
+    # and then *overwrite*. we do not add the addition.
+    # this is the same as adding our contribution to the intermediate value
+    # since addition is commutative (bruh)
+
+    pid_lock_ptr = locks_ptr + intermediate_row
+    # since locks is of form [lock, lock, ..., accessed, accessed]
+    pid_lock_accessed_ptr = locks_ptr + intermediate_row + GROUP_SIZE
+
+    while tl.atomic_cas(pid_lock_ptr, 0, 1) == 1:
+        pass
+
+    count = tl.load(pid_lock_accessed_ptr)
+    if count == 0:
+        tl.atomic_xchg(pid_lock_accessed_ptr, 1)
+    else:
+        row_contribution += tl.load() # load intermediate row here
+    
 
 
 
