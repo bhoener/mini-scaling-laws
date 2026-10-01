@@ -5,8 +5,9 @@ import triton.language as tl
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 cfgs = []
-for warps in [2, 4, 8]:
-    cfgs.append(triton.Config(num_warps=warps))
+for block_size in [1024, 2048, 4096]:
+    for warps in [2, 4, 8]:
+        cfgs.append(triton.Config({"BLOCK_SIZE": block_size}, num_warps=warps))
 
 @triton.autotune(
     configs=cfgs, key={"M", "N"}
@@ -58,6 +59,10 @@ def _group_sum_kernel_1(in_ptr, intermediate_ptr, locks_ptr, M, N, GROUP_SIZE: t
     # since locks is of form [lock, lock, ..., accessed, accessed]
     pid_lock_accessed_ptr = locks_ptr + intermediate_row + GROUP_SIZE
 
+    intermediate_block_start = intermediate_ptr + intermediate_row * N
+    intermediate_offsets = tl.arange(0, BLOCK_SIZE_N)
+    mask_intermediate = intermediate_offsets < N
+
     while tl.atomic_cas(pid_lock_ptr, 0, 1) == 1:
         pass
 
@@ -65,8 +70,39 @@ def _group_sum_kernel_1(in_ptr, intermediate_ptr, locks_ptr, M, N, GROUP_SIZE: t
     if count == 0:
         tl.atomic_xchg(pid_lock_accessed_ptr, 1)
     else:
-        row_contribution += tl.load() # load intermediate row here
-    
+        row_contribution += tl.load(intermediate_block_start + intermediate_offsets, mask=mask_intermediate, other=0.0)
+
+    tl.store(intermediate_block_start + intermediate_offsets, row_contribution, mask=mask_intermediate)
+
+@triton.autotune(
+    configs=cfgs, key={"M", "N"}
+)
+@triton.jit
+def _group_sum_kernel_2(intermediate_ptr, out_ptr, GROUP_SIZE: tl.constexpr, N, BLOCK_SIZE: tl.constexpr):
+    """
+    Now we just sum along cols
+
+    [ |  |  |  | ]
+    [ |  |  |  | ]
+    [ |  |  |  | ]
+    [ V  V  V  V ] => [ x  x  x  x ]
+
+    this might be slop, idk i don't have a gpu to check it since hpc maintenance
+    """
+    col = tl.program_id(axis=0)
+
+    offsets = tl.arange(0, BLOCK_SIZE) * N + col
+
+    mask = tl.arange(0, BLOCK_SIZE) < GROUP_SIZE
+
+
+    col_data = tl.load(intermediate_ptr + offsets, mask=mask, other=0.0)
+
+    sum_res = tl.sum(col_data, axis=0)
+
+    tl.store(out_ptr + col, sum_res)
+
+
 
 
 
@@ -80,9 +116,27 @@ def group_sum(x: torch.Tensor) -> torch.Tensor:
 
     inter = torch.zeros(GROUP_SIZE, N, dtype=torch.float32, device=DEVICE)
 
-    locks = torch.zeros(GROUP_SIZE * 2, type=torch.int32, device=DEVICE)
+    locks = torch.zeros(GROUP_SIZE * 2, dtype=torch.int32, device=DEVICE)
 
     _group_sum_kernel_1[(M,)](x, inter, locks, GROUP_SIZE)
 
+    out = torch.empty(N, device=DEVICE, dtype=torch.float32)
+
+    _group_sum_kernel_2[(N,)](inter, out, GROUP_SIZE, N)
+
+    return out
 
 
+if __name__ == "__main__":
+    x = torch.randn(24, 32, device=DEVICE, dtype=torch.float32)
+
+    x_summed = group_sum(x)
+
+    x_summed_ref = x.sum(dim=0)
+
+    print(x_summed)
+    print(x_summed_ref)
+
+    torch.testing.assert_close(x_summed, x_summed_ref, atol=1e-2, rtol=0)
+    
+    print("PASSED")
