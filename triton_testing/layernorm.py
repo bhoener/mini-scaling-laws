@@ -60,6 +60,9 @@ def _layernorm_backward_dLdx(x_ptr, dLdx_ptr, dLdy_ptr, w_ptr, dLdw_inter_ptr, d
     """
     Pretty much just following the math from https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html,
     though i've probably done something wrong
+
+    interesting. the first row is correct, but all the other rows are wrong.
+    this suggests something is wrong with my pointer math
     """
 
     # each pid represents a row
@@ -69,23 +72,29 @@ def _layernorm_backward_dLdx(x_ptr, dLdx_ptr, dLdy_ptr, w_ptr, dLdw_inter_ptr, d
 
     mask = offsets < N
 
-    offsets += BLOCK_SIZE * x_stride_M
+    offsets += x_stride_M * row
 
     # load components we need
     x_row = tl.load(x_ptr + offsets, mask=mask, other=0.0)
 
-    rstd_row = tl.load(rstd_ptr + offsets, mask=mask, other=0.0)
-    mean_row = tl.load(mean_ptr + offsets, mask=mask, other=0.0)
+    rstd = tl.load(rstd_ptr + row)
+    mean = tl.load(mean_ptr + row)
 
     # recalculate xhat, probably faster than transferring
-    x_hat = (x_row - mean_row) * rstd_row
+    x_hat = (x_row - mean) * rstd
+    x_hat = tl.where(mask, x_hat, 0.0)
 
     dLdy_row = tl.load(dLdy_ptr + offsets, mask=mask, other=0.0)
 
     w_row = tl.load(w_ptr + offsets, mask=mask, other=0.0)
 
+    w_dLdy = w_row * dLdy_row
+
+    c1 = tl.sum(x_hat * w_dLdy, axis=0) / N
+    c2 = tl.sum(w_dLdy, axis=0) / N
+
     # calculate the gradient row
-    dLdx_row = rstd_row * (dLdy_row * w_row - (1 / N * x_hat * (dLdy_row * w_row)) * x_hat - 1/N * dLdy_row * w_row)
+    dLdx_row = rstd * (w_dLdy - c1 * x_hat - c2)
     tl.store(dLdx_ptr + offsets, dLdx_row, mask=mask)
 
     # create our contributions for the row
@@ -241,64 +250,64 @@ class LayerNorm(torch.autograd.Function):
 
 layer_norm = LayerNorm.apply
 
-# def test_layernorm_kernel(
-#     M: int, N: int, dtype: torch.dtype, eps: float = 1e-5, device=DEVICE
-# ):
-#     x = -2.3 + 0.5 * torch.randn((M, N), dtype=dtype, device=DEVICE)
-#     x.requires_grad_(True)
-#     weight = torch.rand((N,), dtype=dtype, device=DEVICE, requires_grad=True)
-#     bias = torch.randn((N,), dtype=dtype, device=DEVICE, requires_grad=True)
-#     y_tri = layer_norm(x, (N,), weight, bias, eps)
-#     y_ref = torch.nn.functional.layer_norm(x, (N,), weight, bias, eps).to(dtype)
-
-#     torch.testing.assert_close(y_tri, y_ref, atol=1e-2, rtol=0)
-#     print("passed forward")
-
-#     # ensure gradients are correct
-#     dLdy = 0.1 * torch.randn_like(x)
-#     y_tri.backward(dLdy, retain_graph=True)
-#     dLdx_tri, dLdw_tri, dLdb_tri = [_.grad.clone() for _ in [x, weight, bias]]
-#     x.grad, weight.grad, bias.grad = None, None, None
-
-#     y_ref.backward(dLdy, retain_graph=True)
-#     dLdx_ref, dLdw_ref, dLdb_ref = [_.grad.clone() for _ in [x, weight, bias]]
-
-
-#     print(dLdx_tri)
-#     print(dLdx_ref)
-#     torch.testing.assert_close(dLdx_tri, dLdx_ref, atol=1e-2, rtol=0)
-#     torch.testing.assert_close(dLdw_tri, dLdw_ref, atol=1e-2, rtol=0)
-#     torch.testing.assert_close(dLdb_tri, dLdb_ref, atol=1e-2, rtol=0)
-#     print("passed backward")
-
-def test_layer_norm(M, N, dtype, eps=1e-5, device=DEVICE):
-    # create data
-    x_shape = (M, N)
-    w_shape = (x_shape[-1], )
-    weight = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
-    bias = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
-    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)
-    dy = .1 * torch.randn_like(x)
+def test_layernorm_kernel(
+    M: int, N: int, dtype: torch.dtype, eps: float = 1e-5, device=DEVICE
+):
+    x = -2.3 + 0.5 * torch.randn((M, N), dtype=dtype, device=DEVICE)
     x.requires_grad_(True)
-    # forward pass
-    y_tri = layer_norm(x, w_shape, weight, bias, eps)
-    y_ref = torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
-    # backward pass (triton)
-    y_tri.backward(dy, retain_graph=True)
-    dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
+    weight = torch.rand((N,), dtype=dtype, device=DEVICE, requires_grad=True)
+    bias = torch.randn((N,), dtype=dtype, device=DEVICE, requires_grad=True)
+    y_tri = layer_norm(x, (N,), weight, bias, eps)
+    y_ref = torch.nn.functional.layer_norm(x, (N,), weight, bias, eps).to(dtype)
+
+    torch.testing.assert_close(y_tri, y_ref, atol=1e-2, rtol=0)
+    print("passed forward")
+
+    # ensure gradients are correct
+    dLdy = 0.1 * torch.randn_like(x)
+    y_tri.backward(dLdy, retain_graph=True)
+    dLdx_tri, dLdw_tri, dLdb_tri = [_.grad.clone() for _ in [x, weight, bias]]
     x.grad, weight.grad, bias.grad = None, None, None
-    # backward pass (torch)
-    y_ref.backward(dy, retain_graph=True)
-    dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
-    # compare
-    print(dx_tri, dx_ref)
-    assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
-    assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
-    assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
-    assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
+
+    y_ref.backward(dLdy, retain_graph=True)
+    dLdx_ref, dLdw_ref, dLdb_ref = [_.grad.clone() for _ in [x, weight, bias]]
+
+
+    print(dLdx_tri)
+    print(dLdx_ref)
+    torch.testing.assert_close(dLdx_tri, dLdx_ref, atol=1e-2, rtol=0)
+    torch.testing.assert_close(dLdw_tri, dLdw_ref, atol=1e-2, rtol=0)
+    torch.testing.assert_close(dLdb_tri, dLdb_ref, atol=1e-2, rtol=0)
+    print("passed backward")
+
+# def test_layer_norm(M, N, dtype, eps=1e-5, device=DEVICE):
+#     # create data
+#     x_shape = (M, N)
+#     w_shape = (x_shape[-1], )
+#     weight = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
+#     bias = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
+#     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)
+#     dy = .1 * torch.randn_like(x)
+#     x.requires_grad_(True)
+#     # forward pass
+#     y_tri = layer_norm(x, w_shape, weight, bias, eps)
+#     y_ref = torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
+#     # backward pass (triton)
+#     y_tri.backward(dy, retain_graph=True)
+#     dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
+#     x.grad, weight.grad, bias.grad = None, None, None
+#     # backward pass (torch)
+#     y_ref.backward(dy, retain_graph=True)
+#     dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
+#     # compare
+#     print(dx_tri, dx_ref)
+#     assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
+#     assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
+#     assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
+#     assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
 
 def main():
-    test_layer_norm(256, 256, torch.float32)
+    test_layernorm_kernel(256, 256, torch.float32)
 
 if __name__ == "__main__":
     main()
