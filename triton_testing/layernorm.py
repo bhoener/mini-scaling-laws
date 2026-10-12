@@ -86,9 +86,11 @@ def _layernorm_backward_dLdx(x_ptr, dLdx_ptr, dLdy_ptr, w_ptr, dLdw_inter_ptr, d
 
     dLdy_row = tl.load(dLdy_ptr + offsets, mask=mask, other=0.0)
 
-    w_row = tl.load(w_ptr + offsets, mask=mask, other=0.0)
+    w_offsets = tl.arange(0, BLOCK_SIZE)
+    w_mask = w_offsets < x_stride_M
+    w = tl.load(w_ptr + w_offsets, mask=w_mask, other=0.0)
 
-    w_dLdy = w_row * dLdy_row
+    w_dLdy = w * dLdy_row
 
     c1 = tl.sum(x_hat * w_dLdy, axis=0) / N
     c2 = tl.sum(w_dLdy, axis=0) / N
@@ -280,34 +282,51 @@ def test_layernorm_kernel(
     torch.testing.assert_close(dLdb_tri, dLdb_ref, atol=1e-2, rtol=0)
     print("passed backward")
 
-# def test_layer_norm(M, N, dtype, eps=1e-5, device=DEVICE):
-#     # create data
-#     x_shape = (M, N)
-#     w_shape = (x_shape[-1], )
-#     weight = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
-#     bias = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
-#     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)
-#     dy = .1 * torch.randn_like(x)
-#     x.requires_grad_(True)
-#     # forward pass
-#     y_tri = layer_norm(x, w_shape, weight, bias, eps)
-#     y_ref = torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
-#     # backward pass (triton)
-#     y_tri.backward(dy, retain_graph=True)
-#     dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
-#     x.grad, weight.grad, bias.grad = None, None, None
-#     # backward pass (torch)
-#     y_ref.backward(dy, retain_graph=True)
-#     dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
-#     # compare
-#     print(dx_tri, dx_ref)
-#     assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
-#     assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
-#     assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
-#     assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["M", "N"],
+        x_vals=[128 * i for i in range(1, 8 + 1)],
+        line_arg="provider",
+        line_vals=["torch", "triton"],
+        line_names=["Torch", "Triton"],
+        plot_name="layernorm-perf",
+        args={"fwdbwd": "backward"},
+        ylabel="GB/s",
+        styles=[("green", "-"), ("blue", "-")],
+    )
+)
+def benchmark(M: int, N: int, provider: str, fwdbwd: str, eps: float = 1e-5) -> tuple[float, ...]:
+    x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+    dLdy = torch.randn_like(x)
+    x.requires_grad_(True)
+    w = torch.randn(N, device=DEVICE, dtype=torch.float32, requires_grad=True)
+    b = torch.randn(N, device=DEVICE, dtype=torch.float32, requires_grad=True)
+
+    quantiles = [0.5, 0.2, 0.8]
+
+    if provider == "torch":
+        fwd = lambda x, w, b, eps: torch.nn.functional.layer_norm(x, normalized_shape=(N,), weight=w, bias=b, eps=eps)
+    if provider == "triton":
+        fwd = lambda x, w, b, eps: layer_norm(x, normalized_shape=(N,), weight=w, bias=b, eps=eps)
+    
+    if fwdbwd == "forward":
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: fwd(x, w, b, eps), quantiles=quantiles)
+
+    if fwdbwd == "backward":
+        out = fwd(x, w, b, eps)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: out.backward(dLdy, retain_graph=True), quantiles=quantiles, grad_to_none=[x], rep=500)
+        
+
+    gbps = lambda ms: x.numel() * x.element_size() / 1e9 / (ms * 1e-3)
+    return gbps(ms), gbps(min_ms), gbps(max_ms)
+
+
 
 def main():
-    test_layernorm_kernel(256, 256, torch.float32)
+    test_layernorm_kernel(256, 512, torch.float32)
+    benchmark.run(show_plots=False, print_data=True, save_path=".")
+
 
 if __name__ == "__main__":
     main()
