@@ -4,9 +4,14 @@ import triton.language as tl
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+cfgs = []
+for bsc in [64, 128, 256]:
+    for bsr in [64, 128, 256]:
+        cfgs.append(triton.Config({"BLOCK_SIZE_COL": bsc, "BLOCK_SIZE_ROW": bsr, "BLOCK_SIZE_D": 128}))
 
+@triton.autotune(configs=cfgs, key={"N", "d"})
 @triton.jit
-def flash_attn_forward(Q_ptr, K_ptr, V_ptr, L_ptr, O_ptr, N, d, Q_stride_N, Q_stride_d, K_stride_N, K_stride_d, V_stride_N, V_stride_d, BLOCK_SIZE_COL: tl.constexpr, BLOCK_SIZE_ROW: tl.constexpr, BLOCK_SIZE_D: tl.constexpr):
+def _flash_attn_forward_kernel(Q_ptr, K_ptr, V_ptr, L_ptr, O_ptr, N, d, Q_stride_N, Q_stride_d, K_stride_N, K_stride_d, V_stride_N, V_stride_d, BLOCK_SIZE_COL: tl.constexpr, BLOCK_SIZE_ROW: tl.constexpr, BLOCK_SIZE_D: tl.constexpr):
     """
     We divide Q into T_r = ceil(N/B_r) blocks of size B_r x d
     K, V into T_c = ceil(N/B_c) blocks
@@ -137,11 +142,40 @@ def flash_attn_forward(Q_ptr, K_ptr, V_ptr, L_ptr, O_ptr, N, d, Q_stride_N, Q_st
         O = (denom ** -1 ) * O
         L = m + tl.log(denom)
 
-        # TODO: store O, L
-        
+        tl.store(O_ptr + offsets_Q, O, mask=Q_mask)
+        tl.store(L_ptr + tl.arange(0, BLOCK_SIZE_ROW), L)
 
 
+def _flash_attn_forward(Q, K, V):
+    B, N, d = Q.size()
+    assert Q.size() == K.size() == V.size()
+    Q, K, V = Q.to(DEVICE).to(torch.float32), K.to(DEVICE).to(torch.float32), V.to(DEVICE).to(torch.float32)
+    O = torch.empty_like(Q)
+    L = torch.empty(N, device=DEVICE, dtype=torch.float32)
 
+    grid = lambda meta: max(tl.cdiv(N, meta["BLOCK_SIZE_ROW"]), tl.cdiv(N, meta["BLOCK_SIZE_COL"]))
+
+    _flash_attn_forward_kernel[grid](Q, K, V, L, O, N, d, Q.stride(0), Q.stride(1), K.stride(0), K.stride(1), V.stride(0), V.stride(1))
+
+    return O
+
+def main():
+    B, T, C = 4, 64, 8
+    Q = torch.randn(B, T, C, device=DEVICE, dtype=torch.float32)
+    K = torch.randn(B, T, C, device=DEVICE, dtype=torch.float32)
+    V = torch.randn(B, T, C, device=DEVICE, dtype=torch.float32)
+
+    
+    ref = torch.nn.functional.scaled_dot_product_attention(Q, K, V, is_causal=True)
+    print("reference:", ref)
+    tri = _flash_attn_forward(Q, K, V)
+    print("tri:", tri)
+    torch.testing.assert_close(ref, tri, atol=1e-2, rtol=0)
+
+    print("Passed test")
+
+if __name__ == "__main__":
+    main()
 
 class FlashAttention(torch.autograd.Function):
     def forward(ctx, Q, K, V, is_causal=True):
