@@ -26,7 +26,7 @@ def _flash_attn_forward_kernel(
     L_ptr,
     O_ptr,
     N,
-    d,
+    d: tl.constexpr,
     Q_stride_N,
     Q_stride_d,
     K_stride_N,
@@ -35,7 +35,6 @@ def _flash_attn_forward_kernel(
     V_stride_d,
     BLOCK_SIZE_COL: tl.constexpr,
     BLOCK_SIZE_ROW: tl.constexpr,
-    BLOCK_SIZE_D: tl.constexpr,
 ):
     """
     We divide Q into T_r = ceil(N/B_r) blocks of size B_r x d
@@ -112,17 +111,17 @@ def _flash_attn_forward_kernel(
         offsets_Q = (
             tl.arange(0, BLOCK_SIZE_ROW)[:, None]
             + pid * BLOCK_SIZE_ROW * Q_stride_N
-            + tl.arange(0, BLOCK_SIZE_D)[None, :] * Q_stride_d
+            + tl.arange(0, d)[None, :] * Q_stride_d
         )
 
         # mask and load Q
         Q_mask = (tl.arange(0, BLOCK_SIZE_ROW) + pid * BLOCK_SIZE_ROW < N)[:, None] & (
-            tl.arange(0, BLOCK_SIZE_D) < d
+            tl.arange(0, d) < d
         )[None, :]
         Q_i = tl.load(Q_ptr + offsets_Q, mask=Q_mask, other=0.0)
 
         # initialize empty output
-        O = tl.zeros((BLOCK_SIZE_ROW, int(d)), dtype=tl.float32)
+        O = tl.zeros((BLOCK_SIZE_ROW, d), dtype=tl.float32)
 
         # denominators l
         denom = tl.zeros((BLOCK_SIZE_ROW,), dtype=tl.float32)
@@ -136,14 +135,17 @@ def _flash_attn_forward_kernel(
                 # create offsets for K
                 offsets_K = (
                     tl.arange(0, BLOCK_SIZE_COL)[:, None]
-                    + pid * BLOCK_SIZE_COL * K_stride_N
-                    + tl.arange(0, BLOCK_SIZE_D)[None, :] * K_stride_d
+                    * K_stride_N
+                    + tl.arange(0, d)[None, :] * K_stride_d
                 )
+
+                print(offsets_K)
+                # definitely wrong
 
                 # mask is same for k and v
                 KV_mask = (tl.arange(0, BLOCK_SIZE_COL) + pid * BLOCK_SIZE_ROW < N)[
                     :, None
-                ] & (tl.arange(0, BLOCK_SIZE_D) < d)[None, :]
+                ] & (tl.arange(0, d) < d)[None, :]
 
                 # load K
                 K_j = tl.load(K_ptr + offsets_K, mask=KV_mask, other=0.0)
@@ -152,7 +154,7 @@ def _flash_attn_forward_kernel(
                 offsets_V = (
                     tl.arange(0, BLOCK_SIZE_COL)[:, None]
                     + pid * BLOCK_SIZE_COL * V_stride_N
-                ) * K_stride_N + tl.arange(0, BLOCK_SIZE_D)[None, :] * V_stride_d
+                ) * K_stride_N + tl.arange(0, d)[None, :] * V_stride_d
 
                 # load V
                 V_j = tl.load(V_ptr + offsets_V, mask=KV_mask, other=0.0)
@@ -160,10 +162,6 @@ def _flash_attn_forward_kernel(
                 # Calculate Q_i K_j^T
                 # (B_r, d) x (d, B_c) -> (B_r, B_c)
                 S = tl.dot(Q_i, tl.trans(K_j))
-
-                # store running maxes
-                m_last = m
-                m = tl.maximum(m, tl.max(S, axis=0))
 
                 # create causal mask
                 causal_mask_bool = (
@@ -175,9 +173,16 @@ def _flash_attn_forward_kernel(
                 # apply casual mask
                 S = S + causal_mask
 
+                # store running maxes
+                m_last = m
+                m = tl.maximum(m, tl.max(S, axis=0))
+                print(m)
+
                 # numerator of softmax
                 P_temp = tl.exp(S - m)
 
+
+                print(S)
                 # update denominator (need to read more into online softmax)
                 denom = tl.exp(m_last - m) * denom + tl.sum(P_temp, axis=0)
 
@@ -187,10 +192,15 @@ def _flash_attn_forward_kernel(
 
                 # O is (B_r, d)
                 # m is (B_r,)
-                print(O.shape, P_temp.shape[0])
-                O = (1.0 / tl.exp(m_last - m))[:, None] * O + tl.dot(P_temp, V_j)
-
-        O = (1.0 / denom) * O
+                print(O)
+                print("1/x", tl.exp(m_last - m))
+                print(1 / tl.exp(m_last - m)[:, None])
+                print(O / tl.exp(m_last - m)[:, None])
+                
+                O = O / tl.exp(m_last - m)[:, None] + tl.dot(P_temp, V_j)
+                
+        O = O / denom[:, None]
+        print(O)
         L = m + tl.log(denom)
 
         tl.store(O_ptr + offsets_Q, O, mask=Q_mask)
@@ -198,7 +208,7 @@ def _flash_attn_forward_kernel(
 
 
 def _flash_attn_forward(Q, K, V):
-    B, N, d = Q.size()
+    N, d = Q.size()
     assert Q.size() == K.size() == V.size()
     Q, K, V = (
         Q.to(DEVICE).to(torch.float32),
@@ -212,6 +222,7 @@ def _flash_attn_forward(Q, K, V):
         max(tl.cdiv(N, meta["BLOCK_SIZE_ROW"]), tl.cdiv(N, meta["BLOCK_SIZE_COL"])),
     )
 
+    print("K stride N:", K.stride(0), "K stride d:", K.stride(1))
 
     BLOCK_SIZE_ROW = 64
     BLOCK_SIZE_COL = 64
@@ -239,10 +250,10 @@ def _flash_attn_forward(Q, K, V):
 
 
 def main():
-    B, T, C = 4, 64, 8
-    Q = torch.randn(B, T, C, device=DEVICE, dtype=torch.float32)
-    K = torch.randn(B, T, C, device=DEVICE, dtype=torch.float32)
-    V = torch.randn(B, T, C, device=DEVICE, dtype=torch.float32)
+    T, C = 64, 8
+    Q = torch.randn(T, C, device=DEVICE, dtype=torch.float32)
+    K = torch.randn(T, C, device=DEVICE, dtype=torch.float32)
+    V = torch.randn(T, C, device=DEVICE, dtype=torch.float32)
 
     ref = torch.nn.functional.scaled_dot_product_attention(Q, K, V, is_causal=True)
     print("reference:", ref)
