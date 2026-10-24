@@ -12,7 +12,7 @@ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 #     for bsr in [64, 128, 256]:
 #         cfgs.append(
 #             triton.Config(
-#                 {"BLOCK_SIZE_COL": bsc, "BLOCK_SIZE_ROW": bsr, "BLOCK_SIZE_D": 128}
+#                 {"BLOCK_SIZE_COL": bsc, "BLOCK_SIZE_ROW": bsr}
 #             )
 #         )
 
@@ -104,107 +104,100 @@ def _flash_attn_forward_kernel(
 
     print("d:", d)
 
-    for i in range(T_r):
-        # (B_r) -> (B_r, 1)
-        # (B_d) -> (1, B_d)
-        # (B_r, 1) + (1, B_d) -> (B_r, B_d)
-        offsets_Q = (
-            tl.arange(0, BLOCK_SIZE_ROW)[:, None]
-            + pid * BLOCK_SIZE_ROW * Q_stride_N
-            + tl.arange(0, d)[None, :] * Q_stride_d
-        )
+    
+    # (B_r) -> (B_r, 1)
+    # (B_d) -> (1, B_d)
+    # (B_r, 1) + (1, B_d) -> (B_r, B_d)
+    offsets_Q = (
+        (tl.arange(0, BLOCK_SIZE_ROW)[:, None]
+         + pid * BLOCK_SIZE_ROW) * Q_stride_N
+        + tl.arange(0, d)[None, :] * Q_stride_d
+    )
 
-        # mask and load Q
-        Q_mask = (tl.arange(0, BLOCK_SIZE_ROW) + pid * BLOCK_SIZE_ROW < N)[:, None] & (
-            tl.arange(0, d) < d
-        )[None, :]
-        Q_i = tl.load(Q_ptr + offsets_Q, mask=Q_mask, other=0.0)
+    # mask and load Q
+    Q_mask = (tl.arange(0, BLOCK_SIZE_ROW) + pid * BLOCK_SIZE_ROW < N)[:, None] & (
+        tl.arange(0, d) < d
+    )[None, :]
+    Q_i = tl.load(Q_ptr + offsets_Q, mask=Q_mask, other=0.0)
 
-        # initialize empty output
-        O = tl.zeros((BLOCK_SIZE_ROW, d), dtype=tl.float32)
+    # initialize empty output
+    O = tl.zeros((BLOCK_SIZE_ROW, d), dtype=tl.float32)
 
-        # denominators l
-        denom = tl.zeros((BLOCK_SIZE_ROW,), dtype=tl.float32)
+    # denominators l
+    denom = tl.zeros((BLOCK_SIZE_ROW,), dtype=tl.float32)
 
-        # row-wise maxes
-        m = tl.full((BLOCK_SIZE_ROW,), float("-inf"), dtype=tl.float32)
+    # row-wise maxes
+    m = tl.full((BLOCK_SIZE_ROW,), float("-inf"), dtype=tl.float32)
 
-        for j in range(T_c):
-            # we can skip if j > i since causal
-            if i <= j:
-                # create offsets for K
-                offsets_K = (
-                    tl.arange(0, BLOCK_SIZE_COL)[:, None]
-                    * K_stride_N
-                    + tl.arange(0, d)[None, :] * K_stride_d
-                )
+    for j in range(T_c):
+        # we can skip if j > i since causal
+        if pid <= j:
+            # create offsets for K
+            offsets_K = (
+                (tl.arange(0, BLOCK_SIZE_COL)[:, None] + j * BLOCK_SIZE_COL)
+                * K_stride_N
+                + tl.arange(0, d)[None, :] * K_stride_d
+            )
 
-                print(offsets_K)
-                # definitely wrong
+            # mask is same for k and v
+            KV_mask = (tl.arange(0, BLOCK_SIZE_COL) + j * BLOCK_SIZE_ROW < N)[
+                :, None
+            ] & (tl.arange(0, d) < d)[None, :]
 
-                # mask is same for k and v
-                KV_mask = (tl.arange(0, BLOCK_SIZE_COL) + pid * BLOCK_SIZE_ROW < N)[
-                    :, None
-                ] & (tl.arange(0, d) < d)[None, :]
-
-                # load K
-                K_j = tl.load(K_ptr + offsets_K, mask=KV_mask, other=0.0)
-
-                # create offsets for V
-                offsets_V = (
-                    tl.arange(0, BLOCK_SIZE_COL)[:, None]
-                    + pid * BLOCK_SIZE_COL * V_stride_N
-                ) * K_stride_N + tl.arange(0, d)[None, :] * V_stride_d
-
-                # load V
-                V_j = tl.load(V_ptr + offsets_V, mask=KV_mask, other=0.0)
-
-                # Calculate Q_i K_j^T
-                # (B_r, d) x (d, B_c) -> (B_r, B_c)
-                S = tl.dot(Q_i, tl.trans(K_j))
-
-                # create causal mask
-                causal_mask_bool = (
-                    tl.arange(0, BLOCK_SIZE_ROW)[:, None]
-                    < tl.arange(0, BLOCK_SIZE_COL)[None, :]
-                )
-                causal_mask = tl.where(causal_mask_bool, float("-inf"), 0)
-
-                # apply casual mask
-                S = S + causal_mask
-
-                # store running maxes
-                m_last = m
-                m = tl.maximum(m, tl.max(S, axis=0))
-                print(m)
-
-                # numerator of softmax
-                P_temp = tl.exp(S - m)
+            # load K
+            K_j = tl.load(K_ptr + offsets_K, mask=KV_mask, other=0.0)
 
 
-                print(S)
-                # update denominator (need to read more into online softmax)
-                denom = tl.exp(m_last - m) * denom + tl.sum(P_temp, axis=0)
+            # create offsets for V
+            offsets_V = (
+                (tl.arange(0, BLOCK_SIZE_COL)[:, None] + j * BLOCK_SIZE_COL)
+                * V_stride_N + tl.arange(0, d)[None, :] * V_stride_d
+            )
 
-                # calculate block output
-                # P_temp is (B_r, B_c), V is (B_c, d)
-                # PV is (B_r, d)
+            # load V
+            V_j = tl.load(V_ptr + offsets_V, mask=KV_mask, other=0.0)
 
-                # O is (B_r, d)
-                # m is (B_r,)
-                print(O)
-                print("1/x", tl.exp(m_last - m))
-                print(1 / tl.exp(m_last - m)[:, None])
-                print(O / tl.exp(m_last - m)[:, None])
-                
-                O = O / tl.exp(m_last - m)[:, None] + tl.dot(P_temp, V_j)
-                
-        O = O / denom[:, None]
-        print(O)
-        L = m + tl.log(denom)
+            # Calculate Q_i K_j^T
+            # (B_r, d) x (d, B_c) -> (B_r, B_c)
+            S = tl.dot(Q_i, tl.trans(K_j))
 
-        tl.store(O_ptr + offsets_Q, O, mask=Q_mask)
-        tl.store(L_ptr + tl.arange(0, BLOCK_SIZE_ROW), L)
+            causal_mask_bool = (
+                tl.arange(0, BLOCK_SIZE_ROW)[:, None] + (pid * BLOCK_SIZE_ROW)
+                < tl.arange(0, BLOCK_SIZE_COL)[None, :] + (j * BLOCK_SIZE_COL)
+            )
+            causal_mask = tl.where(causal_mask_bool, float("-inf"), 0)
+
+            # apply casual mask
+            S = S + causal_mask
+
+            # store running maxes
+            m_last = m
+
+            m = tl.maximum(m, tl.max(S, axis=1))
+
+            # numerator of softmax
+            P_temp = tl.exp(S - m[:, None])
+
+
+            # update denominator (need to read more into online softmax)
+            # denom is (B_r,)
+            # m is (B_r,)
+            # P_temp is (B_r, B_c)
+            denom = tl.exp(m_last - m) * denom + tl.sum(P_temp, axis=1)
+
+            # calculate block output
+            # P_temp is (B_r, B_c), V is (B_c, d)
+            # PV is (B_r, d)
+
+            # O is (B_r, d)
+            # m is (B_r,)
+            O = O * tl.exp(m_last - m)[:, None] + tl.dot(P_temp, V_j)
+
+    O = O / denom[:, None]
+    L = m + tl.log(denom)
+
+    tl.store(O_ptr + offsets_Q, O, mask=Q_mask)
+    tl.store(L_ptr + tl.arange(0, BLOCK_SIZE_ROW), L)
 
 
 def _flash_attn_forward(Q, K, V):
@@ -219,14 +212,13 @@ def _flash_attn_forward(Q, K, V):
     L = torch.empty(N, device=DEVICE, dtype=torch.float32)
 
     grid = lambda meta: (
-        max(tl.cdiv(N, meta["BLOCK_SIZE_ROW"]), tl.cdiv(N, meta["BLOCK_SIZE_COL"])),
+        tl.cdiv(N, meta["BLOCK_SIZE_ROW"]),
     )
 
     print("K stride N:", K.stride(0), "K stride d:", K.stride(1))
 
-    BLOCK_SIZE_ROW = 64
-    BLOCK_SIZE_COL = 64
-    BLOCK_SIZE_D = 64
+    BLOCK_SIZE_ROW = 16
+    BLOCK_SIZE_COL = 8
     _flash_attn_forward_kernel[grid](
         Q,
         K,
@@ -243,7 +235,6 @@ def _flash_attn_forward(Q, K, V):
         V_stride_d=V.stride(1),
         BLOCK_SIZE_ROW=BLOCK_SIZE_ROW,
         BLOCK_SIZE_COL=BLOCK_SIZE_COL,
-        BLOCK_SIZE_D=BLOCK_SIZE_D,
     )
 
     return O
@@ -259,6 +250,8 @@ def main():
     print("reference:", ref)
     tri = _flash_attn_forward(Q, K, V)
     print("tri:", tri)
+
+    print(ref == tri)
     torch.testing.assert_close(ref, tri, atol=1e-2, rtol=0)
 
     print("Passed test")
