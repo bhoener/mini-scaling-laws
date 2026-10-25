@@ -3,7 +3,11 @@ import os
 
 os.environ["TRITON_INTERPRET"] = "1"
 import triton
-import triton.language as tl
+import triton.language as tl\
+
+import numpy as np
+np.set_printoptions(precision=4, floatmode="fixed", suppress=True)
+torch.set_printoptions(precision=2, sci_mode=False)
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -95,6 +99,24 @@ def _flash_attn_forward_kernel(
     yes, this is the same. we don't have to deal with transposing the blocks or anything since
     the blocks are all along one dimension
 
+    this is very hard to debug. there is nothing obviously wrong in any of the stages.
+
+    the offsets look okay and all the intermediate values are plausible.
+
+    only the first row is correct, which means nearly anything could be broken
+
+    interestingly, it is the first row of the first block that is correct
+    and not the whole block.
+
+    this means P_temp @ V_j is correct for the first row of P and first column of V
+
+    which means at least one of the following:
+
+    - one of the rows of m is wrong
+    - one of the rows of S is wrong
+
+    (assuming V_j is correct)
+
     """
 
     # start with the pid and some constants
@@ -131,7 +153,7 @@ def _flash_attn_forward_kernel(
 
     for j in range(T_c):
         # we can skip if j > i since causal
-        if pid <= j:
+        if not (j * BLOCK_SIZE_COL >= (pid + 1) * BLOCK_SIZE_ROW):
             # create offsets for K
             offsets_K = (
                 (tl.arange(0, BLOCK_SIZE_COL)[:, None] + j * BLOCK_SIZE_COL)
@@ -139,8 +161,10 @@ def _flash_attn_forward_kernel(
                 + tl.arange(0, d)[None, :] * K_stride_d
             )
 
+            #print("offsets_K:", offsets_K)
+
             # mask is same for k and v
-            KV_mask = (tl.arange(0, BLOCK_SIZE_COL) + j * BLOCK_SIZE_ROW < N)[
+            KV_mask = (tl.arange(0, BLOCK_SIZE_COL) + j * BLOCK_SIZE_COL < N)[
                 :, None
             ] & (tl.arange(0, d) < d)[None, :]
 
@@ -153,22 +177,25 @@ def _flash_attn_forward_kernel(
                 (tl.arange(0, BLOCK_SIZE_COL)[:, None] + j * BLOCK_SIZE_COL)
                 * V_stride_N + tl.arange(0, d)[None, :] * V_stride_d
             )
+            #print("offsets_V:", offsets_V)
 
             # load V
             V_j = tl.load(V_ptr + offsets_V, mask=KV_mask, other=0.0)
 
             # Calculate Q_i K_j^T
             # (B_r, d) x (d, B_c) -> (B_r, B_c)
+            
             S = tl.dot(Q_i, tl.trans(K_j))
+            
+            if pid * BLOCK_SIZE_ROW < (j + 1) * BLOCK_SIZE_COL:
+                causal_mask_bool = (
+                    tl.arange(0, BLOCK_SIZE_ROW)[:, None] + (pid * BLOCK_SIZE_ROW)
+                    < tl.arange(0, BLOCK_SIZE_COL)[None, :] + (j * BLOCK_SIZE_COL)
+                )
+                causal_mask = tl.where(causal_mask_bool, float("-inf"), 0)
 
-            causal_mask_bool = (
-                tl.arange(0, BLOCK_SIZE_ROW)[:, None] + (pid * BLOCK_SIZE_ROW)
-                < tl.arange(0, BLOCK_SIZE_COL)[None, :] + (j * BLOCK_SIZE_COL)
-            )
-            causal_mask = tl.where(causal_mask_bool, float("-inf"), 0)
-
-            # apply casual mask
-            S = S + causal_mask
+                # apply casual mask
+                S = S + causal_mask
 
             # store running maxes
             m_last = m
@@ -193,6 +220,9 @@ def _flash_attn_forward_kernel(
             # m is (B_r,)
             O = O * tl.exp(m_last - m)[:, None] + tl.dot(P_temp, V_j)
 
+            # print(f"i={pid}, j={j}", "K:", K_j, "V:", V_j, "S:", S, "M_last:", m_last, "M:", m, "P_temp:", P_temp, "denom:", denom, "O:", O, sep="\n")
+    # if pid * BLOCK_SIZE_ROW <= j * BLOCK_SIZE_COL:
+    #     print("K:", K_j, "V:", V_j, "S:", S, "M_last:", m_last, "M:", m, "P_temp:", P_temp, "denom:", denom, "O:", O, sep="\n")
     O = O / denom[:, None]
     L = m + tl.log(denom)
 
@@ -217,7 +247,7 @@ def _flash_attn_forward(Q, K, V):
 
     print("K stride N:", K.stride(0), "K stride d:", K.stride(1))
 
-    BLOCK_SIZE_ROW = 16
+    BLOCK_SIZE_ROW = 4
     BLOCK_SIZE_COL = 8
     _flash_attn_forward_kernel[grid](
         Q,
