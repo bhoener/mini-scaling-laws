@@ -3,9 +3,9 @@ import os
 
 os.environ["TRITON_INTERPRET"] = "1"
 import triton
-import triton.language as tl\
-
+import triton.language as tl
 import numpy as np
+
 np.set_printoptions(precision=4, floatmode="fixed", suppress=True)
 torch.set_printoptions(precision=2, sci_mode=False)
 
@@ -117,6 +117,24 @@ def _flash_attn_forward_kernel(
 
     (assuming V_j is correct)
 
+
+    ok, what are we doing?
+
+                    K^T
+             [ x  x  x  x  x ]
+        [ x ][ T  T  T  T  T ]
+        [ x ][ T  T  T  T  T ]
+    Q   [ x ][ T  T  T  T  T ]
+        [ x ][ T  T  T  T  T ]
+        [ x ][ T  T  T  T  T ]
+
+    interesting. the first two rows of our output are almost identical.
+    why is this? all indices look good.
+
+    nevermind. this has stopped happening (?)
+
+
+
     """
 
     # start with the pid and some constants
@@ -126,15 +144,12 @@ def _flash_attn_forward_kernel(
 
     print("d:", d)
 
-    
     # (B_r) -> (B_r, 1)
     # (B_d) -> (1, B_d)
     # (B_r, 1) + (1, B_d) -> (B_r, B_d)
     offsets_Q = (
-        (tl.arange(0, BLOCK_SIZE_ROW)[:, None]
-         + pid * BLOCK_SIZE_ROW) * Q_stride_N
-        + tl.arange(0, d)[None, :] * Q_stride_d
-    )
+        tl.arange(0, BLOCK_SIZE_ROW)[:, None] + pid * BLOCK_SIZE_ROW
+    ) * Q_stride_N + tl.arange(0, d)[None, :] * Q_stride_d
 
     # mask and load Q
     Q_mask = (tl.arange(0, BLOCK_SIZE_ROW) + pid * BLOCK_SIZE_ROW < N)[:, None] & (
@@ -156,10 +171,8 @@ def _flash_attn_forward_kernel(
         if not (j * BLOCK_SIZE_COL >= (pid + 1) * BLOCK_SIZE_ROW):
             # create offsets for K
             offsets_K = (
-                (tl.arange(0, BLOCK_SIZE_COL)[:, None] + j * BLOCK_SIZE_COL)
-                * K_stride_N
-                + tl.arange(0, d)[None, :] * K_stride_d
-            )
+                tl.arange(0, BLOCK_SIZE_COL)[:, None] + j * BLOCK_SIZE_COL
+            ) * K_stride_N + tl.arange(0, d)[None, :] * K_stride_d
 
             #print("offsets_K:", offsets_K)
 
@@ -171,12 +184,10 @@ def _flash_attn_forward_kernel(
             # load K
             K_j = tl.load(K_ptr + offsets_K, mask=KV_mask, other=0.0)
 
-
             # create offsets for V
             offsets_V = (
-                (tl.arange(0, BLOCK_SIZE_COL)[:, None] + j * BLOCK_SIZE_COL)
-                * V_stride_N + tl.arange(0, d)[None, :] * V_stride_d
-            )
+                tl.arange(0, BLOCK_SIZE_COL)[:, None] + j * BLOCK_SIZE_COL
+            ) * V_stride_N + tl.arange(0, d)[None, :] * V_stride_d
             #print("offsets_V:", offsets_V)
 
             # load V
@@ -184,14 +195,13 @@ def _flash_attn_forward_kernel(
 
             # Calculate Q_i K_j^T
             # (B_r, d) x (d, B_c) -> (B_r, B_c)
-            
+
             S = tl.dot(Q_i, tl.trans(K_j))
-            
+
             if pid * BLOCK_SIZE_ROW < (j + 1) * BLOCK_SIZE_COL:
-                causal_mask_bool = (
-                    tl.arange(0, BLOCK_SIZE_ROW)[:, None] + (pid * BLOCK_SIZE_ROW)
-                    < tl.arange(0, BLOCK_SIZE_COL)[None, :] + (j * BLOCK_SIZE_COL)
-                )
+                causal_mask_bool = tl.arange(0, BLOCK_SIZE_ROW)[:, None] + (
+                    pid * BLOCK_SIZE_ROW
+                ) < tl.arange(0, BLOCK_SIZE_COL)[None, :] + (j * BLOCK_SIZE_COL)
                 causal_mask = tl.where(causal_mask_bool, float("-inf"), 0)
 
                 # apply casual mask
@@ -205,12 +215,13 @@ def _flash_attn_forward_kernel(
             # numerator of softmax
             P_temp = tl.exp(S - m[:, None])
 
+            scale = tl.exp(m_last - m)
 
             # update denominator (need to read more into online softmax)
             # denom is (B_r,)
             # m is (B_r,)
             # P_temp is (B_r, B_c)
-            denom = tl.exp(m_last - m) * denom + tl.sum(P_temp, axis=1)
+            denom = scale * denom + tl.sum(P_temp, axis=1)
 
             # calculate block output
             # P_temp is (B_r, B_c), V is (B_c, d)
@@ -218,14 +229,37 @@ def _flash_attn_forward_kernel(
 
             # O is (B_r, d)
             # m is (B_r,)
-            O = O * tl.exp(m_last - m)[:, None] + tl.dot(P_temp, V_j)
+            # what is this actually calculating?
+            # similar to https://arxiv.org/pdf/1805.02867 algorithm 3
+            # denom = denom * exp(m_last - m) + exp(x_i - m)
+            #       = denom * exp(m_last) / exp(m) + exp(x_i) / exp(m)
+            # for example, j=0
+            # denom = 0
+            # j = 1
+            # m = -inf
+            # denom = 0 * exp(-inf - 0) + exp(x_1) / exp(0) = exp(x_1)
+            # j = 2
+            # note that in this example, x_j is is scalar
+            # m = max(m, m_last) = max(x_2, x_1)
+            # denom = exp(x_j) * exp(x_1 - max(x_2, x_1)) + exp(x_2 - max(x_2, x_1))
+
+            # interestingly, we are calculating O at the same time as the denominator
+            # while in the above paper, they calculate the two separately
+
+            # for intuition, it seems like the scale factor rescales O by
+            # removing the previous scale via multiplication and adding the
+            # new scale via division.
+
+            O = O * scale[:, None] + tl.dot(P_temp, V_j)
+
 
             # print(f"i={pid}, j={j}", "K:", K_j, "V:", V_j, "S:", S, "M_last:", m_last, "M:", m, "P_temp:", P_temp, "denom:", denom, "O:", O, sep="\n")
+            print(f"O for i={pid}, j={j}:", O, "scale:", scale)
     # if pid * BLOCK_SIZE_ROW <= j * BLOCK_SIZE_COL:
     #     print("K:", K_j, "V:", V_j, "S:", S, "M_last:", m_last, "M:", m, "P_temp:", P_temp, "denom:", denom, "O:", O, sep="\n")
     O = O / denom[:, None]
     L = m + tl.log(denom)
-
+    #print(offsets_Q)
     tl.store(O_ptr + offsets_Q, O, mask=Q_mask)
     tl.store(L_ptr + tl.arange(0, BLOCK_SIZE_ROW), L)
 
@@ -241,9 +275,7 @@ def _flash_attn_forward(Q, K, V):
     O = torch.empty_like(Q)
     L = torch.empty(N, device=DEVICE, dtype=torch.float32)
 
-    grid = lambda meta: (
-        tl.cdiv(N, meta["BLOCK_SIZE_ROW"]),
-    )
+    grid = lambda meta: (tl.cdiv(N, meta["BLOCK_SIZE_ROW"]),)
 
     print("K stride N:", K.stride(0), "K stride d:", K.stride(1))
 
