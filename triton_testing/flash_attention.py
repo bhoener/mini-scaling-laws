@@ -133,7 +133,31 @@ def _flash_attn_forward_kernel(
 
     nevermind. this has stopped happening (?)
 
+    notably, the first row of the output is the same as the first row of V.
+    q_i^T k_j has some random value, but we softmax with all n=1..j so it just becomes 1,
+    which weights v_j.
+                        [ x ]
+                        [ x ]
+                        [ x ]
+                    k_j [ x ]
+                        [ x ]
+           q_i^T        [ x ]
+    [ x  x  x  x  x  x ][ y ] * [ x  x  x  x  x  x ]
 
+    and with SM(QK^T)V it is
+
+               [ x  x ]     V
+            K^T[ x  x ][ x  x  x ]
+          Q    [ x  x ][ x  x  x ]
+    [ x  x  x ][ y  y ][ z  z  z ]
+    [ x  x  x ][ y  y ][ z  z  z ]
+
+    note that each y is q_i^T k_j and this is multiplied and summed by v to get z
+
+    
+    this is probably why the code is correct for the first row.
+
+    something about the online softmax or the calculation of S is likely wrong.
 
     """
 
@@ -312,6 +336,8 @@ def main():
     print("reference:", ref)
     tri = _flash_attn_forward(Q, K, V)
     print("tri:", tri)
+    print("ref:", ref)
+    print("v:", V)
 
     print(ref == tri)
     torch.testing.assert_close(ref, tri, atol=1e-2, rtol=0)
