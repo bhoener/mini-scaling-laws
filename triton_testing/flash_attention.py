@@ -159,6 +159,36 @@ def _flash_attn_forward_kernel(
 
     something about the online softmax or the calculation of S is likely wrong.
 
+    i also checked whether turning off is_causal had any impact. with it off,
+    i got zero correct rows. this makes sense since my one row is only correct because
+    it does not get any contributions from previous tokens.
+
+    this means my causal mask is (probably) not the issue
+
+    when i set q and k to all zeros, things seem to work correctly.
+
+    this seems to imply there is an issue in calculating QK^T
+
+    when i set Q[1] = ones, K[1] = ones, v[1] = zeros,
+    i get a row of zeros in my triton output
+    while the reference gives it a row of 0.06
+
+    could this actually be a causal mask issue?
+                     [ 0  1  0  0 ]
+                     [ 0  1  0  0 ]                     []
+                     [ 0  1  0  0 ]                     []
+                     [ 0  1  0  0 ]                     []
+                     [ 0  1  0  0 ]                     []
+    [ 0  0  0  0  0 ][ 0  0  0  0 ]   [1/c 1/c 1/c 1/c]
+    [ 1  1  1  1  1 ][ 0  d  0  0 ] ->[~0  ~1  ~0  ~0 ] 
+    [ 0  0  0  0  0 ][ 0  0  0  0 ]   [1/c 1/c 1/c 1/c]
+    [ 0  0  0  0  0 ][ 0  0  0  0 ]   [1/c 1/c 1/c 1/c]
+
+    the one row of v is all zeros, so the little bit must
+    be coming from the row before it
+
+    note that the inner product of q_1 and k^T_0 is 0
+    so the softmax is producing the little bit
     """
 
     # start with the pid and some constants
@@ -221,6 +251,7 @@ def _flash_attn_forward_kernel(
             # (B_r, d) x (d, B_c) -> (B_r, B_c)
 
             S = tl.dot(Q_i, tl.trans(K_j))
+            
 
             if pid * BLOCK_SIZE_ROW < (j + 1) * BLOCK_SIZE_COL:
                 causal_mask_bool = tl.arange(0, BLOCK_SIZE_ROW)[:, None] + (
@@ -231,6 +262,7 @@ def _flash_attn_forward_kernel(
                 # apply casual mask
                 S = S + causal_mask
 
+
             # store running maxes
             m_last = m
 
@@ -238,6 +270,7 @@ def _flash_attn_forward_kernel(
 
             # numerator of softmax
             P_temp = tl.exp(S - m[:, None])
+            print(S, P_temp)
 
             scale = tl.exp(m_last - m)
 
@@ -278,7 +311,7 @@ def _flash_attn_forward_kernel(
 
 
             # print(f"i={pid}, j={j}", "K:", K_j, "V:", V_j, "S:", S, "M_last:", m_last, "M:", m, "P_temp:", P_temp, "denom:", denom, "O:", O, sep="\n")
-            print(f"O for i={pid}, j={j}:", O, "scale:", scale)
+            #print(f"O for i={pid}, j={j}:", O, "scale:", scale)
     # if pid * BLOCK_SIZE_ROW <= j * BLOCK_SIZE_COL:
     #     print("K:", K_j, "V:", V_j, "S:", S, "M_last:", m_last, "M:", m, "P_temp:", P_temp, "denom:", denom, "O:", O, sep="\n")
     O = O / denom[:, None]
@@ -304,7 +337,7 @@ def _flash_attn_forward(Q, K, V):
     print("K stride N:", K.stride(0), "K stride d:", K.stride(1))
 
     BLOCK_SIZE_ROW = 4
-    BLOCK_SIZE_COL = 8
+    BLOCK_SIZE_COL = 2
     _flash_attn_forward_kernel[grid](
         Q,
         K,
@@ -327,10 +360,13 @@ def _flash_attn_forward(Q, K, V):
 
 
 def main():
-    T, C = 64, 8
-    Q = torch.randn(T, C, device=DEVICE, dtype=torch.float32)
-    K = torch.randn(T, C, device=DEVICE, dtype=torch.float32)
-    V = torch.randn(T, C, device=DEVICE, dtype=torch.float32)
+    T, C = 16, 4
+    Q = torch.zeros(T, C, device=DEVICE, dtype=torch.float32)
+    K = torch.zeros(T, C, device=DEVICE, dtype=torch.float32)
+    V = torch.ones(T, C, device=DEVICE, dtype=torch.float32)
+    V[1] *= 0
+    Q[1] += 1
+    K[1] += 1
 
     ref = torch.nn.functional.scaled_dot_product_attention(Q, K, V, is_causal=True)
     print("reference:", ref)
