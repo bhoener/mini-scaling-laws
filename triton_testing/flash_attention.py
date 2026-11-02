@@ -175,20 +175,22 @@ def _flash_attn_forward_kernel(
 
     could this actually be a causal mask issue?
                      [ 0  1  0  0 ]
-                     [ 0  1  0  0 ]                     []
-                     [ 0  1  0  0 ]                     []
-                     [ 0  1  0  0 ]                     []
-                     [ 0  1  0  0 ]                     []
-    [ 0  0  0  0  0 ][ 0  0  0  0 ]   [1/c 1/c 1/c 1/c]
-    [ 1  1  1  1  1 ][ 0  d  0  0 ] ->[~0  ~1  ~0  ~0 ] 
-    [ 0  0  0  0  0 ][ 0  0  0  0 ]   [1/c 1/c 1/c 1/c]
-    [ 0  0  0  0  0 ][ 0  0  0  0 ]   [1/c 1/c 1/c 1/c]
+                     [ 0  1  0  0 ]                     [v11 v12 v13 v14]
+                     [ 0  1  0  0 ]                     [v21 v22 v23 v24]
+                     [ 0  1  0  0 ]                     [v31 v32 v33 v34]
+                     [ 0  1  0  0 ]                     [ ...     ...   ]
+    [ 0  0  0  0  0 ][ 0  -  -  - ]   [1    0   0   0 ] [v11 v12 v13 v14]
+    [ 1  1  1  1  1 ][ 0  d  -  - ] ->[~0  ~1   0   0 ]~[v21 v22 v23 v24]
+    [ 0  0  0  0  0 ][ 0  0  0  - ]   [... ... ...  0 ]     :     :
+    [ 0  0  0  0  0 ][ 0  0  0  0 ]   [... ... ... ...] [ ...     ...   ]
 
     the one row of v is all zeros, so the little bit must
     be coming from the row before it
 
     note that the inner product of q_1 and k^T_0 is 0
     so the softmax is producing the little bit
+
+
     """
 
     # start with the pid and some constants
@@ -270,7 +272,7 @@ def _flash_attn_forward_kernel(
 
             # numerator of softmax
             P_temp = tl.exp(S - m[:, None])
-            print(S, P_temp)
+            print(S, P_temp, sep="\n")
 
             scale = tl.exp(m_last - m)
 
@@ -360,7 +362,7 @@ def _flash_attn_forward(Q, K, V):
 
 
 def main():
-    T, C = 16, 4
+    T, C = 4, 2
     Q = torch.zeros(T, C, device=DEVICE, dtype=torch.float32)
     K = torch.zeros(T, C, device=DEVICE, dtype=torch.float32)
     V = torch.ones(T, C, device=DEVICE, dtype=torch.float32)
