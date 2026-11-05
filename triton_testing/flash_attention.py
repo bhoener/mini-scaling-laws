@@ -190,6 +190,13 @@ def _flash_attn_forward_kernel(
     note that the inner product of q_1 and k^T_0 is 0
     so the softmax is producing the little bit
 
+    interestingly, one time it gave the output -1.64, -1.64 for the second row.
+    i have not since been able to reproduce this.
+
+    is it the denominator that is incorrect? all the rows after the row of zeros are good.
+    
+    even if i set B_r to 2, the values are correct.
+
 
     """
 
@@ -272,7 +279,7 @@ def _flash_attn_forward_kernel(
 
             # numerator of softmax
             P_temp = tl.exp(S - m[:, None])
-            print(S, P_temp, sep="\n")
+            #print(S, P_temp, sep="\n")
 
             scale = tl.exp(m_last - m)
 
@@ -312,13 +319,14 @@ def _flash_attn_forward_kernel(
             O = O * scale[:, None] + tl.dot(P_temp, V_j)
 
 
-            # print(f"i={pid}, j={j}", "K:", K_j, "V:", V_j, "S:", S, "M_last:", m_last, "M:", m, "P_temp:", P_temp, "denom:", denom, "O:", O, sep="\n")
+            print(f"i={pid}, j={j}", "K:", K_j, "V:", V_j, "S:", S, "M_last:", m_last, "M:", m, "P_temp:", P_temp, "denom:", denom, "O:", O, sep="\n")
+            print("PV:", tl.dot(P_temp, V_j))
             #print(f"O for i={pid}, j={j}:", O, "scale:", scale)
     # if pid * BLOCK_SIZE_ROW <= j * BLOCK_SIZE_COL:
     #     print("K:", K_j, "V:", V_j, "S:", S, "M_last:", m_last, "M:", m, "P_temp:", P_temp, "denom:", denom, "O:", O, sep="\n")
     O = O / denom[:, None]
     L = m + tl.log(denom)
-    #print(offsets_Q)
+    print(offsets_Q)
     tl.store(O_ptr + offsets_Q, O, mask=Q_mask)
     tl.store(L_ptr + tl.arange(0, BLOCK_SIZE_ROW), L)
 
@@ -361,6 +369,25 @@ def _flash_attn_forward(Q, K, V):
     return O
 
 
+def online_softmax(x: torch.Tensor):
+    assert x.ndim == 2
+    out = torch.empty_like(x)
+
+    
+    for i in range(x.size(0)):
+        m = float("-inf")
+        d = 0
+        for j in range(x.size(1)):
+            m_last = m
+            m = max(m, x[i, j])
+            d = d * torch.exp(m_last - m) + torch.exp(x[i, j] - m)
+
+        for j in range(x.size(1)):
+            out[i, j] = torch.exp(x[i, j] - m) / d
+
+    return out
+
+
 def main():
     T, C = 4, 2
     Q = torch.zeros(T, C, device=DEVICE, dtype=torch.float32)
@@ -378,9 +405,19 @@ def main():
     print("v:", V)
 
     print(ref == tri)
+
+    x = torch.randn(24, 32)
+    
+    softmax_test = online_softmax(x)
+    softmax_ref = torch.softmax(x, dim=-1)
+
+    torch.testing.assert_close(softmax_test, softmax_ref, atol=1e-2, rtol=0)
+    print("online softmax passed")
     torch.testing.assert_close(ref, tri, atol=1e-2, rtol=0)
 
     print("Passed test")
+
+    
 
 
 if __name__ == "__main__":
