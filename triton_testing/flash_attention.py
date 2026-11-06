@@ -1,7 +1,5 @@
 import torch
 import os
-
-os.environ["TRITON_INTERPRET"] = "1"
 import triton
 import triton.language as tl
 import numpy as np
@@ -334,7 +332,7 @@ def _flash_attn_forward(Q, K, V):
     O = torch.empty_like(Q)
     L = torch.empty(N, device=DEVICE, dtype=torch.float32)
 
-    grid = lambda meta: (tl.cdiv(N, meta["BLOCK_SIZE_ROW"]),)
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_ROW"]),)
 
 
     _flash_attn_forward_kernel[grid](
@@ -405,7 +403,7 @@ def main():
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["N"],
-        x_vals=[128*i for i in range(2, 32)],
+        x_vals=[128*i for i in range(2, 64)],
         line_arg="provider",
         line_vals=["torch", "triton"],
         line_names=["Torch", "Triton"],
@@ -417,9 +415,9 @@ def main():
     )
 )
 def benchmark(N: int, d: int, provider: str) -> float | tuple[float, ...]:
-    Q = torch.randn(N, d, device=DEVICE, dtype=torch.bfloat16)
-    K = torch.randn(N, d, device=DEVICE, dtype=torch.bfloat16)
-    V = torch.randn(N, d, device=DEVICE, dtype=torch.bfloat16)
+    Q = torch.randn(N, d, device=DEVICE, dtype=torch.bfloat16, requires_grad=False)
+    K = torch.randn(N, d, device=DEVICE, dtype=torch.bfloat16, requires_grad=False)
+    V = torch.randn(N, d, device=DEVICE, dtype=torch.bfloat16, requires_grad=False)
 
     quantiles = [0.5, 0.2, 0.8]
 
