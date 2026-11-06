@@ -11,17 +11,17 @@ torch.set_printoptions(precision=2, sci_mode=False)
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# cfgs = []
-# for bsc in [64, 128, 256]:
-#     for bsr in [64, 128, 256]:
-#         cfgs.append(
-#             triton.Config(
-#                 {"BLOCK_SIZE_COL": bsc, "BLOCK_SIZE_ROW": bsr}
-#             )
-#         )
+cfgs = []
+for bsc in [64, 128]:
+    for bsr in [64, 32]:
+        cfgs.append(
+            triton.Config(
+                {"BLOCK_SIZE_COL": bsc, "BLOCK_SIZE_ROW": bsr}
+            )
+        )
 
 
-# @triton.autotune(configs=cfgs, key={"N", "d"})
+@triton.autotune(configs=cfgs, key={"N", "d"})
 @triton.jit
 def _flash_attn_forward_kernel(
     Q_ptr,
@@ -39,6 +39,7 @@ def _flash_attn_forward_kernel(
     V_stride_d,
     BLOCK_SIZE_COL: tl.constexpr,
     BLOCK_SIZE_ROW: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
 ):
     """
     We divide Q into T_r = ceil(N/B_r) blocks of size B_r x d
@@ -205,23 +206,22 @@ def _flash_attn_forward_kernel(
     T_r = tl.cdiv(N, BLOCK_SIZE_ROW)
     T_c = tl.cdiv(N, BLOCK_SIZE_COL)
 
-    print("d:", d)
 
     # (B_r) -> (B_r, 1)
     # (B_d) -> (1, B_d)
     # (B_r, 1) + (1, B_d) -> (B_r, B_d)
     offsets_Q = (
         tl.arange(0, BLOCK_SIZE_ROW)[:, None] + pid * BLOCK_SIZE_ROW
-    ) * Q_stride_N + tl.arange(0, d)[None, :] * Q_stride_d
+    ) * Q_stride_N + tl.arange(0, BLOCK_SIZE_D)[None, :] * Q_stride_d
 
     # mask and load Q
     Q_mask = (tl.arange(0, BLOCK_SIZE_ROW) + pid * BLOCK_SIZE_ROW < N)[:, None] & (
-        tl.arange(0, d) < d
+        tl.arange(0, BLOCK_SIZE_D) < d
     )[None, :]
     Q_i = tl.load(Q_ptr + offsets_Q, mask=Q_mask, other=0.0)
 
     # initialize empty output
-    O = tl.zeros((BLOCK_SIZE_ROW, d), dtype=tl.float32)
+    O = tl.zeros((BLOCK_SIZE_ROW, BLOCK_SIZE_D), dtype=tl.float32)
 
     # denominators l
     denom = tl.zeros((BLOCK_SIZE_ROW,), dtype=tl.float32)
@@ -235,14 +235,14 @@ def _flash_attn_forward_kernel(
             # create offsets for K
             offsets_K = (
                 tl.arange(0, BLOCK_SIZE_COL)[:, None] + j * BLOCK_SIZE_COL
-            ) * K_stride_N + tl.arange(0, d)[None, :] * K_stride_d
+            ) * K_stride_N + tl.arange(0, BLOCK_SIZE_D)[None, :] * K_stride_d
 
             #print("offsets_K:", offsets_K)
 
             # mask is same for k and v
             KV_mask = (tl.arange(0, BLOCK_SIZE_COL) + j * BLOCK_SIZE_COL < N)[
                 :, None
-            ] & (tl.arange(0, d) < d)[None, :]
+            ] & (tl.arange(0, BLOCK_SIZE_D) < d)[None, :]
 
             # load K
             K_j = tl.load(K_ptr + offsets_K, mask=KV_mask, other=0.0)
@@ -250,8 +250,7 @@ def _flash_attn_forward_kernel(
             # create offsets for V
             offsets_V = (
                 tl.arange(0, BLOCK_SIZE_COL)[:, None] + j * BLOCK_SIZE_COL
-            ) * V_stride_N + tl.arange(0, d)[None, :] * V_stride_d
-            #print("offsets_V:", offsets_V)
+            ) * V_stride_N + tl.arange(0, BLOCK_SIZE_D)[None, :] * V_stride_d
 
             # load V
             V_j = tl.load(V_ptr + offsets_V, mask=KV_mask, other=0.0)
@@ -259,7 +258,7 @@ def _flash_attn_forward_kernel(
             # Calculate Q_i K_j^T
             # (B_r, d) x (d, B_c) -> (B_r, B_c)
 
-            S = tl.dot(Q_i, tl.trans(K_j))
+            S = tl.dot(Q_i, tl.trans(K_j)) * (d ** -0.5)
             
 
             if pid * BLOCK_SIZE_ROW < (j + 1) * BLOCK_SIZE_COL:
@@ -279,7 +278,6 @@ def _flash_attn_forward_kernel(
 
             # numerator of softmax
             P_temp = tl.exp(S - m[:, None])
-            #print(S, P_temp, sep="\n")
 
             scale = tl.exp(m_last - m)
 
@@ -318,17 +316,11 @@ def _flash_attn_forward_kernel(
 
             O = O * scale[:, None] + tl.dot(P_temp, V_j)
 
-
-            print(f"i={pid}, j={j}", "K:", K_j, "V:", V_j, "S:", S, "M_last:", m_last, "M:", m, "P_temp:", P_temp, "denom:", denom, "O:", O, sep="\n")
-            print("PV:", tl.dot(P_temp, V_j))
-            #print(f"O for i={pid}, j={j}:", O, "scale:", scale)
-    # if pid * BLOCK_SIZE_ROW <= j * BLOCK_SIZE_COL:
-    #     print("K:", K_j, "V:", V_j, "S:", S, "M_last:", m_last, "M:", m, "P_temp:", P_temp, "denom:", denom, "O:", O, sep="\n")
     O = O / denom[:, None]
     L = m + tl.log(denom)
-    print(offsets_Q)
+
     tl.store(O_ptr + offsets_Q, O, mask=Q_mask)
-    tl.store(L_ptr + tl.arange(0, BLOCK_SIZE_ROW), L)
+    tl.store(L_ptr + pid * BLOCK_SIZE_ROW + tl.arange(0, BLOCK_SIZE_ROW), L)
 
 
 def _flash_attn_forward(Q, K, V):
@@ -344,10 +336,7 @@ def _flash_attn_forward(Q, K, V):
 
     grid = lambda meta: (tl.cdiv(N, meta["BLOCK_SIZE_ROW"]),)
 
-    print("K stride N:", K.stride(0), "K stride d:", K.stride(1))
 
-    BLOCK_SIZE_ROW = 4
-    BLOCK_SIZE_COL = 2
     _flash_attn_forward_kernel[grid](
         Q,
         K,
@@ -362,8 +351,7 @@ def _flash_attn_forward(Q, K, V):
         K_stride_d=K.stride(1),
         V_stride_N=V.stride(0),
         V_stride_d=V.stride(1),
-        BLOCK_SIZE_ROW=BLOCK_SIZE_ROW,
-        BLOCK_SIZE_COL=BLOCK_SIZE_COL,
+        BLOCK_SIZE_D=triton.next_power_of_2(d)
     )
 
     return O
@@ -389,22 +377,16 @@ def online_softmax(x: torch.Tensor):
 
 
 def main():
-    T, C = 4, 2
-    Q = torch.zeros(T, C, device=DEVICE, dtype=torch.float32)
-    K = torch.zeros(T, C, device=DEVICE, dtype=torch.float32)
-    V = torch.ones(T, C, device=DEVICE, dtype=torch.float32)
-    V[1] *= 0
-    Q[1] += 1
-    K[1] += 1
+    T, C = 64, 18
+    Q = torch.randn(T, C, device=DEVICE, dtype=torch.float32)
+    K = torch.randn(T, C, device=DEVICE, dtype=torch.float32)
+    V = torch.randn(T, C, device=DEVICE, dtype=torch.float32)
 
     ref = torch.nn.functional.scaled_dot_product_attention(Q, K, V, is_causal=True)
     print("reference:", ref)
     tri = _flash_attn_forward(Q, K, V)
     print("tri:", tri)
     print("ref:", ref)
-    print("v:", V)
-
-    print(ref == tri)
 
     x = torch.randn(24, 32)
     
@@ -417,8 +399,38 @@ def main():
 
     print("Passed test")
 
-    
+    benchmark.run(show_plots=False, print_data=True, save_path=".")
 
+ 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["N"],
+        x_vals=[128*i for i in range(2, 32)],
+        line_arg="provider",
+        line_vals=["torch", "triton"],
+        line_names=["Torch", "Triton"],
+        plot_name="flash_attn_perf",
+        args={"d": 16},
+        xlabel=["sequence length"],
+        ylabel="tflops",
+        styles=[("green", "-"), ("blue", "-")]
+    )
+)
+def benchmark(N: int, d: int, provider: str) -> float | tuple[float, ...]:
+    Q = torch.randn(N, d, device=DEVICE, dtype=torch.bfloat16)
+    K = torch.randn(N, d, device=DEVICE, dtype=torch.bfloat16)
+    V = torch.randn(N, d, device=DEVICE, dtype=torch.bfloat16)
+
+    quantiles = [0.5, 0.2, 0.8]
+
+    if provider == "torch":
+        with torch.no_grad():
+            ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.nn.functional.scaled_dot_product_attention(Q, K, V, is_causal=True), quantiles=quantiles)
+    if provider == "triton":
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: _flash_attn_forward(Q, K, V), quantiles=quantiles)
+
+    tflops = lambda ms: 4 * N ** 2 * d / 1e12 / (ms * 1e-3)
+    return tflops(ms), tflops(min_ms), tflops(max_ms)
 
 if __name__ == "__main__":
     main()
