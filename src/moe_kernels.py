@@ -28,7 +28,6 @@ def _moe_forward_kernel(
     BLOCK_SIZE_DO: tl.constexpr,
     GROUP_SIZE_T: tl.constexpr,
     GROUP_SIZE_DH: tl.constexpr,
-    GROUP_SIZE_DO: tl.constexpr,
 ):
     """
       this is much simpler than i thought. we are just doing grouped_mm twice,
@@ -57,8 +56,6 @@ def _moe_forward_kernel(
 
       note also that we need to do this twice.
 
-      we also must read the offsets from the index tensors
-
       also we are dealing with 3-dimensional tensors
       so we have to parallelize along B
 
@@ -67,7 +64,24 @@ def _moe_forward_kernel(
       remember that our tensor is of shape (num_experts, j1, d_model)
       and the values are (BT, d_model)
 
+      ok, if we assume d <= BLOCK_SIZE_D, things are simpler
 
+      we can also choose not to parallelize along F and have each program loop locally
+
+      accum = zeros
+      for i in range(tl.cdiv(F, BLOCK_SIZE_F)):
+        h = matmul(...)
+        out = h @ W2[...]
+        accum += out
+
+
+        
+                        [ x ]
+        so              [ x ]
+          d  [ x  x  x ][ x ]
+   PID0 [ x ][ y  y  y ][ z ]
+   PID1 [ x ][ y  y  y ][ z ]
+   PID2 [ x ][ y  y  y ][ z ]
     """
 
     pid = tl.program_id(axis=0)
@@ -103,9 +117,9 @@ def _moe_forward_kernel(
     
     accumulator = tl.zeros((BLOCK_SIZE_BT, BLOCK_SIZE_DH), dtype=tl.float32)
 
-    print(x_offsets.shape, x_mask.shape)
+    #print(x_offsets.shape, x_mask.shape)
     for i in range(tl.cdiv(d_in, BLOCK_SIZE_D)):
-        print(x_offsets.shape, x_mask.shape)
+        #print(f"pid {pid} | i={i} |", x_offsets.shape, x_mask.shape)
         x_block = tl.load(x_ptr + x_offsets, mask=x_mask, other=0.0)
         w1_block = tl.load(w1_ptr + w1_offsets, mask=w1_mask, other=0.0)
 
@@ -114,10 +128,12 @@ def _moe_forward_kernel(
         x_offsets += BLOCK_SIZE_D * x_stride_d_in
         w1_offsets += BLOCK_SIZE_D * w1_stride_d_in
 
-        x_mask = ((tl.arange(0, BLOCK_SIZE_D)[:, None] + i * BLOCK_SIZE_D) < d_in) & ((tl.arange(0, BLOCK_SIZE_BT)[None, :] + pid_m * BLOCK_SIZE_BT) < BT)
-        w1_mask = ((tl.arange(0, BLOCK_SIZE_D)[None, :] + i * BLOCK_SIZE_D) < d_in) & ((tl.arange(0, BLOCK_SIZE_DH)[:, None] + pid_n * BLOCK_SIZE_DH) < d_h)
+       
+        # for some reason, [:, None] doesn't work here and we need to use unsqueeze
+        # sounds like interpreter bug
+        x_mask = ((tl.unsqueeze(tl.arange(0, BLOCK_SIZE_BT), 1) + pid_m * BLOCK_SIZE_BT) < BT) & ((tl.arange(0, BLOCK_SIZE_D)[None, :] + i * BLOCK_SIZE_D) < d_in)
+        w1_mask = ((tl.arange(0, BLOCK_SIZE_D)[:, None] + i * BLOCK_SIZE_D) < d_in) & ((tl.arange(0, BLOCK_SIZE_DH)[None, :] + pid_n * BLOCK_SIZE_DH) < d_h)
 
-    print(accumulator)
 
 def _moe_expert_forward(
     x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
