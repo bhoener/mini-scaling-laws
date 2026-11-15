@@ -12,29 +12,27 @@ def _moe_forward_kernel(
     w1_ptr,
     w2_ptr,
     out_ptr,
-    d_in,
-    d_h,
-    d_out,
+    d,
+    F,
     BT,
     x_stride_BT,
-    x_stride_d_in,
-    w1_stride_d_in,
-    w1_stride_d_h,
-    w2_stride_d_h,
-    w2_stride_d_out,
+    x_stride_d,
+    w1_stride_d,
+    w1_stride_F,
+    w2_stride_F,
+    w2_stride_d,
     BLOCK_SIZE_BT: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
-    BLOCK_SIZE_DH: tl.constexpr,
-    BLOCK_SIZE_DO: tl.constexpr,
+    BLOCK_SIZE_F: tl.constexpr,
     GROUP_SIZE_T: tl.constexpr,
-    GROUP_SIZE_DH: tl.constexpr,
+    GROUP_SIZE_F: tl.constexpr,
 ):
     """
       this is much simpler than i thought. we are just doing grouped_mm twice,
       instead of doing gate projections and rearranging tokens.
 
       what we need to do:
-                          d_h
+                          F
                      [ x  x  x  x ]
                    d [ x  x  x  x ]
                      [ x  x  x  x ]
@@ -86,53 +84,58 @@ def _moe_forward_kernel(
 
     pid = tl.program_id(axis=0)
 
-    group_id = pid // (GROUP_SIZE_T * GROUP_SIZE_DH)
+    group_id = pid // (GROUP_SIZE_T * GROUP_SIZE_F)
 
 
-    groups_along_d_h = tl.cdiv(d_h, BLOCK_SIZE_DH * GROUP_SIZE_DH)
+    groups_along_F = tl.cdiv(F, BLOCK_SIZE_F * GROUP_SIZE_F)
 
-    group_x = group_id % groups_along_d_h
-    group_y = group_id // groups_along_d_h
+    group_x = group_id % groups_along_F
+    group_y = group_id // groups_along_F
 
-    first_pid_in_group = group_id * GROUP_SIZE_T * GROUP_SIZE_DH
+    first_pid_in_group = group_id * GROUP_SIZE_T * GROUP_SIZE_F
 
     group_relative_offset = pid - first_pid_in_group
 
-    group_relative_m = group_relative_offset // GROUP_SIZE_DH
-    group_relative_n = group_relative_offset % GROUP_SIZE_DH
+    group_relative_m = group_relative_offset // GROUP_SIZE_F
+    group_relative_n = group_relative_offset % GROUP_SIZE_F
 
     pid_m = group_y * GROUP_SIZE_T + group_relative_m
-    pid_n = group_x * GROUP_SIZE_DH + group_relative_n
+    pid_n = group_x * GROUP_SIZE_F + group_relative_n
 
     print(f"Pid {pid}: ({pid_m}, {pid_n})")
 
     # (B_t, 1) * (1, B_d)
-    x_offsets = (tl.arange(0, BLOCK_SIZE_BT)[:, None] + pid_m * BLOCK_SIZE_BT) * x_stride_BT + tl.arange(0, BLOCK_SIZE_D)[None, :] * x_stride_d_in 
-    x_mask = ((tl.arange(0, BLOCK_SIZE_BT)[:, None] + pid_m * BLOCK_SIZE_BT) < BT) & (tl.arange(0, BLOCK_SIZE_D)[None, :] < d_in )
+    x_offsets = (tl.arange(0, BLOCK_SIZE_BT)[:, None] + pid_m * BLOCK_SIZE_BT) * x_stride_BT + tl.arange(0, BLOCK_SIZE_D)[None, :] * x_stride_d
+    x_mask = ((tl.arange(0, BLOCK_SIZE_BT)[:, None] + pid_m * BLOCK_SIZE_BT) < BT) & (tl.arange(0, BLOCK_SIZE_D)[None, :] < d )
 
     # (B_d, 1) * (1, B_dh)
-    w1_offsets = tl.arange(0, BLOCK_SIZE_D)[:, None] * w1_stride_d_in + (tl.arange(0, BLOCK_SIZE_DH)[None, :] + pid_n * BLOCK_SIZE_DH) * w1_stride_d_h
-    w1_mask = (tl.arange(0, BLOCK_SIZE_D)[:, None] < d_in) & ((tl.arange(0, BLOCK_SIZE_DH)[None, :] + pid_n * BLOCK_SIZE_DH) < d_h)
+    w1_offsets = tl.arange(0, BLOCK_SIZE_D)[:, None] * w1_stride_d + (tl.arange(0, BLOCK_SIZE_F)[None, :] + pid_n * BLOCK_SIZE_F) * w1_stride_F
+    w1_mask = (tl.arange(0, BLOCK_SIZE_D)[:, None] < d) & ((tl.arange(0, BLOCK_SIZE_F)[None, :] + pid_n * BLOCK_SIZE_F) < F)
+    w2_offsets = (tl.arange(0, BLOCK_SIZE_F)[:, None]) * w2_stride_F + (tl.arange(0, BLOCK_SIZE_D)[None, :]) * w2_stride_d
+    w2_mask = ((tl.arange(0, BLOCK_SIZE_F)[:, None] < F) & ((tl.arange(0, BLOCK_SIZE_D)[None, :] + pid_n * BLOCK_SIZE_D) < d))
 
-    
-    accumulator = tl.zeros((BLOCK_SIZE_BT, BLOCK_SIZE_DH), dtype=tl.float32)
+
+    x_block = tl.load(x_ptr + x_offsets, mask=x_mask, other=0.0)
+
+    accumulator = tl.zeros((BLOCK_SIZE_BT, BLOCK_SIZE_D), dtype=tl.float32)
 
     #print(x_offsets.shape, x_mask.shape)
-    for i in range(tl.cdiv(d_in, BLOCK_SIZE_D)):
-        #print(f"pid {pid} | i={i} |", x_offsets.shape, x_mask.shape)
-        x_block = tl.load(x_ptr + x_offsets, mask=x_mask, other=0.0)
+    
+    #print(f"pid {pid} | i={i} |", x_offsets.shape, x_mask.shape)
+
+    for i in range(tl.cdiv(F, BLOCK_SIZE_F)):
         w1_block = tl.load(w1_ptr + w1_offsets, mask=w1_mask, other=0.0)
+        w2_block = tl.load(w2_ptr + w2_offsets, mask=w2_mask, other=0.0)
 
         accumulator = tl.dot(x_block, w1_block, acc=accumulator) # possibly just =
 
-        x_offsets += BLOCK_SIZE_D * x_stride_d_in
-        w1_offsets += BLOCK_SIZE_D * w1_stride_d_in
+        w1_offsets += BLOCK_SIZE_D * w1_stride_d
 
-       
+        
         # for some reason, [:, None] doesn't work here and we need to use unsqueeze
         # sounds like interpreter bug
-        x_mask = ((tl.unsqueeze(tl.arange(0, BLOCK_SIZE_BT), 1) + pid_m * BLOCK_SIZE_BT) < BT) & ((tl.arange(0, BLOCK_SIZE_D)[None, :] + i * BLOCK_SIZE_D) < d_in)
-        w1_mask = ((tl.arange(0, BLOCK_SIZE_D)[:, None] + i * BLOCK_SIZE_D) < d_in) & ((tl.arange(0, BLOCK_SIZE_DH)[None, :] + pid_n * BLOCK_SIZE_DH) < d_h)
+        # x_mask = ((tl.unsqueeze(tl.arange(0, BLOCK_SIZE_BT), 1) + pid_m * BLOCK_SIZE_BT) < BT) & ((tl.arange(0, BLOCK_SIZE_D)[None, :] + i * BLOCK_SIZE_D) < d_in)
+        # w1_mask = ((tl.arange(0, BLOCK_SIZE_D)[:, None] + i * BLOCK_SIZE_D) < d_in) & ((tl.arange(0, BLOCK_SIZE_F)[None, :] + pid_n * BLOCK_SIZE_F) < d_h)
 
 
 def _moe_expert_forward(
@@ -146,12 +149,9 @@ def _moe_expert_forward(
     )
 
     BLOCK_SIZE_BT = 4
-    BLOCK_SIZE_D = 16
-    BLOCK_SIZE_DH = 4
-    BLOCK_SIZE_DO = 4,
+    BLOCK_SIZE_D = triton.next_power_of_2(x.size(1))
     GROUP_SIZE_T = 2
-    GROUP_SIZE_DH = 2
-    GROUP_SIZE_DO = 2
+    GROUP_SIZE_D = 2
     _moe_forward_kernel[grid](
         x_ptr=x,
         w1_ptr=w1,
@@ -163,17 +163,14 @@ def _moe_expert_forward(
         BT=x.size(0),
         x_stride_BT=x.stride(0),
         x_stride_d_in=x.stride(1),
-        w1_stride_d_in=w1.stride(0),
-        w1_stride_d_h=w1.stride(1),
-        w2_stride_d_h=w2.stride(0),
-        w2_stride_d_out=w2.stride(1),
+        w1_stride_d=w1.stride(0),
+        w1_stride_F=w1.stride(1),
+        w2_stride_F=w2.stride(0),
+        w2_stride_d=w2.stride(1),
         BLOCK_SIZE_BT=BLOCK_SIZE_BT,
         BLOCK_SIZE_D=BLOCK_SIZE_D,
-        BLOCK_SIZE_DH=BLOCK_SIZE_DH,
-        BLOCK_SIZE_DO=BLOCK_SIZE_DO,
         GROUP_SIZE_T=GROUP_SIZE_T,
-        GROUP_SIZE_DH=GROUP_SIZE_DH,
-        GROUP_SIZE_DO=GROUP_SIZE_DO,
+        GROUP_SIZE_D=GROUP_SIZE_D,
     )
 
     return out
