@@ -21,6 +21,8 @@ def _moe_forward_kernel(
     w1_stride_F,
     w2_stride_F,
     w2_stride_d,
+    out_stride_BT,
+    out_stride_d,
     BLOCK_SIZE_BT: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_F: tl.constexpr,
@@ -110,9 +112,9 @@ def _moe_forward_kernel(
 
     # (B_d, 1) * (1, B_dh)
     w1_offsets = tl.arange(0, BLOCK_SIZE_D)[:, None] * w1_stride_d + (tl.arange(0, BLOCK_SIZE_F)[None, :] + pid_n * BLOCK_SIZE_F) * w1_stride_F
-    w1_mask = (tl.arange(0, BLOCK_SIZE_D)[:, None] < d) & ((tl.arange(0, BLOCK_SIZE_F)[None, :] + pid_n * BLOCK_SIZE_F) < F)
+    w1_mask = ((tl.arange(0, BLOCK_SIZE_D)[:, None]) < d) & ((tl.arange(0, BLOCK_SIZE_F)[None, :]) < F)
     w2_offsets = (tl.arange(0, BLOCK_SIZE_F)[:, None]) * w2_stride_F + (tl.arange(0, BLOCK_SIZE_D)[None, :]) * w2_stride_d
-    w2_mask = ((tl.arange(0, BLOCK_SIZE_F)[:, None] < F) & ((tl.arange(0, BLOCK_SIZE_D)[None, :] + pid_n * BLOCK_SIZE_D) < d))
+    w2_mask = ((tl.arange(0, BLOCK_SIZE_F)[:, None]) < F) & ((tl.arange(0, BLOCK_SIZE_D)[None, :]) < d)
 
 
     x_block = tl.load(x_ptr + x_offsets, mask=x_mask, other=0.0)
@@ -127,15 +129,31 @@ def _moe_forward_kernel(
         w1_block = tl.load(w1_ptr + w1_offsets, mask=w1_mask, other=0.0)
         w2_block = tl.load(w2_ptr + w2_offsets, mask=w2_mask, other=0.0)
 
-        accumulator = tl.dot(x_block, w1_block, acc=accumulator) # possibly just =
+        h = tl.dot(x_block, w1_block)
 
-        w1_offsets += BLOCK_SIZE_D * w1_stride_d
+        h_act = h * tl.sigmoid(h)
 
+        accumulator = tl.dot(h_act, w2_block, acc=accumulator)
+
+        w1_offsets += BLOCK_SIZE_F * w1_stride_F
+        w2_offsets += BLOCK_SIZE_F * w2_stride_F
+
+        # print(w1_offsets, w2_offsets)
         
-        # for some reason, [:, None] doesn't work here and we need to use unsqueeze
-        # sounds like interpreter bug
-        # x_mask = ((tl.unsqueeze(tl.arange(0, BLOCK_SIZE_BT), 1) + pid_m * BLOCK_SIZE_BT) < BT) & ((tl.arange(0, BLOCK_SIZE_D)[None, :] + i * BLOCK_SIZE_D) < d_in)
-        # w1_mask = ((tl.arange(0, BLOCK_SIZE_D)[:, None] + i * BLOCK_SIZE_D) < d_in) & ((tl.arange(0, BLOCK_SIZE_F)[None, :] + pid_n * BLOCK_SIZE_F) < d_h)
+        
+        w1_mask = ((tl.arange(0, BLOCK_SIZE_D)[:, None]) < d) & ((tl.arange(0, BLOCK_SIZE_F)[None, :] + i * BLOCK_SIZE_F) < F)
+        w2_mask = ((tl.arange(0, BLOCK_SIZE_F)[:, None] + i * BLOCK_SIZE_F) < F) & ((tl.arange(0, BLOCK_SIZE_D)[None, :]) < d)
+
+        print(h, h_act)
+
+    out_offsets_bt = tl.arange(0, BLOCK_SIZE_BT) + pid * BLOCK_SIZE_BT
+    out_offsets_d = tl.arange(0, BLOCK_SIZE_D)
+
+    out_mask = (out_offsets_bt[:, None] < BT) & (out_offsets_d[None, :] < d)
+
+    out_offsets = out_offsets_bt[:, None] * out_stride_BT + out_offsets_d[None, :] * out_stride_d
+
+    tl.store(out_ptr + out_offsets, accumulator, out_mask)
 
 
 def _moe_expert_forward(
@@ -145,32 +163,34 @@ def _moe_expert_forward(
 
     grid = lambda meta: (
         triton.cdiv(x.size(0), meta["BLOCK_SIZE_BT"])
-        * triton.cdiv(w1.size(1), meta["BLOCK_SIZE_DH"]),
+        * triton.cdiv(w1.size(1), meta["BLOCK_SIZE_D"]),
     )
 
     BLOCK_SIZE_BT = 4
     BLOCK_SIZE_D = triton.next_power_of_2(x.size(1))
     GROUP_SIZE_T = 2
-    GROUP_SIZE_D = 2
+    GROUP_SIZE_F = 2
     _moe_forward_kernel[grid](
         x_ptr=x,
         w1_ptr=w1,
         w2_ptr=w2,
         out_ptr=out,
-        d_in=x.size(0),
-        d_h=w1.size(1),
-        d_out=x.size(0),
+        d=x.size(0),
+        F=w1.size(1),
         BT=x.size(0),
         x_stride_BT=x.stride(0),
-        x_stride_d_in=x.stride(1),
+        x_stride_d=x.stride(1),
         w1_stride_d=w1.stride(0),
         w1_stride_F=w1.stride(1),
         w2_stride_F=w2.stride(0),
         w2_stride_d=w2.stride(1),
+        out_stride_BT=out.stride(0),
+        out_stride_d=out.stride(1),
         BLOCK_SIZE_BT=BLOCK_SIZE_BT,
         BLOCK_SIZE_D=BLOCK_SIZE_D,
+        BLOCK_SIZE_F=BLOCK_SIZE_D,
         GROUP_SIZE_T=GROUP_SIZE_T,
-        GROUP_SIZE_D=GROUP_SIZE_D,
+        GROUP_SIZE_F=GROUP_SIZE_F,
     )
 
     return out
@@ -198,8 +218,8 @@ def main() -> None:
     print(test_tensor)
     print(test_tensor.values())
 
-    w1 = torch.randn(C, d_h, device=DEVICE, dtype=torch.float32)
-    w2 = torch.randn(d_h, C, device=DEVICE, dtype=torch.float32)
+    w1 = torch.randn(C, d_h, device=DEVICE, dtype=torch.float32) / C**0.5
+    w2 = torch.randn(d_h, C, device=DEVICE, dtype=torch.float32) / d_h**0.5
 
     out = _moe_expert_forward(x, w1, w2)
 
