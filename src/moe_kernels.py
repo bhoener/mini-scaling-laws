@@ -111,7 +111,7 @@ def _moe_forward_kernel(
     x_mask = ((tl.arange(0, BLOCK_SIZE_BT)[:, None] + pid_m * BLOCK_SIZE_BT) < BT) & (tl.arange(0, BLOCK_SIZE_D)[None, :] < d )
 
     # (B_d, 1) * (1, B_dh)
-    w1_offsets = tl.arange(0, BLOCK_SIZE_D)[:, None] * w1_stride_d + (tl.arange(0, BLOCK_SIZE_F)[None, :] + pid_n * BLOCK_SIZE_F) * w1_stride_F
+    w1_offsets = tl.arange(0, BLOCK_SIZE_D)[:, None] * w1_stride_d + tl.arange(0, BLOCK_SIZE_F)[None, :] * w1_stride_F
     w1_mask = ((tl.arange(0, BLOCK_SIZE_D)[:, None]) < d) & ((tl.arange(0, BLOCK_SIZE_F)[None, :]) < F)
     w2_offsets = (tl.arange(0, BLOCK_SIZE_F)[:, None]) * w2_stride_F + (tl.arange(0, BLOCK_SIZE_D)[None, :]) * w2_stride_d
     w2_mask = ((tl.arange(0, BLOCK_SIZE_F)[:, None]) < F) & ((tl.arange(0, BLOCK_SIZE_D)[None, :]) < d)
@@ -129,7 +129,12 @@ def _moe_forward_kernel(
         w1_block = tl.load(w1_ptr + w1_offsets, mask=w1_mask, other=0.0)
         w2_block = tl.load(w2_ptr + w2_offsets, mask=w2_mask, other=0.0)
 
+        print("w1_offsets", w1_offsets)
+        #print("x_block:", x_block, "w1_block:", w1_block)
+
         h = tl.dot(x_block, w1_block)
+
+    
 
         h_act = h * tl.sigmoid(h)
 
@@ -144,7 +149,7 @@ def _moe_forward_kernel(
         w1_mask = ((tl.arange(0, BLOCK_SIZE_D)[:, None]) < d) & ((tl.arange(0, BLOCK_SIZE_F)[None, :] + i * BLOCK_SIZE_F) < F)
         w2_mask = ((tl.arange(0, BLOCK_SIZE_F)[:, None] + i * BLOCK_SIZE_F) < F) & ((tl.arange(0, BLOCK_SIZE_D)[None, :]) < d)
 
-        print(h, h_act)
+        #print("h:", h, "h_act:", h_act)
 
     out_offsets_bt = tl.arange(0, BLOCK_SIZE_BT) + pid * BLOCK_SIZE_BT
     out_offsets_d = tl.arange(0, BLOCK_SIZE_D)
@@ -199,8 +204,8 @@ def _moe_expert_forward(
 def main() -> None:
     DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    B, T, C, d_h = 2, 16, 32, 48
-    print(torch.zeros(triton.cdiv(T, 4), triton.cdiv(d_h, 4)))
+    B, T, C, F = 2, 16, 32, 128
+    print(torch.zeros(triton.cdiv(T, 4), triton.cdiv(F, 4)))
     x = torch.randn((B*T, C), device=DEVICE, dtype=torch.float32)
 
     test = [
@@ -218,13 +223,14 @@ def main() -> None:
     print(test_tensor)
     print(test_tensor.values())
 
-    w1 = torch.randn(C, d_h, device=DEVICE, dtype=torch.float32) / C**0.5
-    w2 = torch.randn(d_h, C, device=DEVICE, dtype=torch.float32) / d_h**0.5
+    w1 = torch.randn(C, F, device=DEVICE, dtype=torch.float32) / C**0.5
+    w2 = torch.randn(F, C, device=DEVICE, dtype=torch.float32) / F**0.5
 
     out = _moe_expert_forward(x, w1, w2)
 
     print(out)
 
+    print("w1 numel:", w1.numel())
 
 if __name__ == "__main__":
     main()
